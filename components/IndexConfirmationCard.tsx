@@ -1,22 +1,9 @@
-import type {
-  Block,
-  ConfirmationClass,
-  ConfirmationScore,
-  IndexFutures,
-  Tone,
-} from "@/lib/types";
+import type { Block, ConfirmationScore, IndexFutures, Tone } from "@/lib/types";
 import { pct } from "@/lib/format";
-import { arrowFor } from "@/lib/scoring";
+import { arrowFor, confirmationTone } from "@/lib/scoring";
 
 import { Card } from "./ui/Card";
 import { BlockUnavailable } from "./ui/StatusBadge";
-
-const CLASS_TONE: Record<ConfirmationClass, Tone> = {
-  STRONG: "supportive",
-  MODERATE: "neutral",
-  WEAK: "restrictive",
-  DIVERGENT: "restrictive",
-};
 
 const TONE_TEXT: Record<Tone, string> = {
   supportive: "text-pos",
@@ -82,7 +69,7 @@ export function IndexConfirmationCard({
             <span className="eyebrow">Confirmation</span>
             <span
               className={`text-sm font-semibold tracking-wide ${
-                TONE_TEXT[CLASS_TONE[score.classification]]
+                TONE_TEXT[confirmationTone(score)]
               }`}
             >
               {score.classification}

@@ -1,5 +1,6 @@
 import type { DashboardData, Regime, RiskLevel, TodayRead as Read, Tone } from "@/lib/types";
 import { etTime } from "@/lib/format";
+import { confirmationTone } from "@/lib/scoring";
 
 import { Card } from "./ui/Card";
 import { ScoreBar } from "./ui/ScoreBar";
@@ -30,11 +31,20 @@ const TONE_TEXT: Record<Tone, string> = {
   restrictive: "text-neg",
 };
 
-function Pillar({ label, value }: { label: string; value: string }) {
+function Pillar({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: string;
+  /** Overrides the label-based colour when meaning depends on direction. */
+  tone?: Tone;
+}) {
   return (
     <div className="flex items-baseline justify-between gap-3 border-b border-line-soft py-2 last:border-b-0">
       <span className="text-xs text-ink-3">{label}</span>
-      <span className={`text-xs font-semibold ${TONE_TEXT[pillarTone(value)]}`}>
+      <span className={`text-xs font-semibold ${TONE_TEXT[tone ?? pillarTone(value)]}`}>
         {value}
       </span>
     </div>
@@ -111,7 +121,15 @@ export function TodayRead({
             <Pillar label="Breadth" value={read.breadth} />
             <Pillar label="Rotation" value={read.rotation} />
             <Pillar label="Stress" value={read.stress} />
-            <Pillar label="Confirmation" value={read.confirmation} />
+            <Pillar
+              label="Confirmation"
+              value={read.confirmation}
+              tone={
+                data.derived.confirmation
+                  ? confirmationTone(data.derived.confirmation)
+                  : undefined
+              }
+            />
           </div>
 
           {/* Interpretation */}

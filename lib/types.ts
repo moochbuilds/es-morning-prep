@@ -254,6 +254,12 @@ export interface RotationScore {
 
 export interface ConfirmationScore {
   classification: ConfirmationClass;
+  /**
+   * Direction being confirmed (ES's own sign). Classification and score measure
+   * how well NQ/RTY agree with ES, not whether that is good for equities: a
+   * STRONG confirmation of a selloff is risk-off.
+   */
+  bias: "up" | "down" | "flat";
   score: number;
   interpretation: string;
   legs: Array<{ symbol: string; changePct: number; direction: Direction }>;

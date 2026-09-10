@@ -34,6 +34,7 @@ import type {
   Sectors,
   StressScore,
   TodayRead,
+  Tone,
   Volatility,
 } from "./types";
 
@@ -355,10 +356,30 @@ export function scoreConfirmation(
 
   return {
     classification,
+    bias: esSign > 0 ? "up" : esSign < 0 ? "down" : "flat",
     score: CONFIRMATION.scoreByClass[classification],
     interpretation: confirmationSentence(esSign, nqSign, rtySign, legs),
     legs,
   };
+}
+
+/**
+ * Confirmation in risk-on polarity. A strongly confirmed selloff is as risk-off
+ * as a strongly confirmed rally is risk-on, so the class score is mirrored when
+ * ES is falling. Snapshots written before `bias` existed read as neutral.
+ */
+export function confirmationPolarity(c: ConfirmationScore): number {
+  if (c.bias === "up") return c.score;
+  if (c.bias === "down") return 100 - c.score;
+  return 50;
+}
+
+/** Colour for a confirmation reading: what it means for equities, not its label. */
+export function confirmationTone(c: ConfirmationScore): Tone {
+  const polarity = confirmationPolarity(c);
+  if (polarity >= 70) return "supportive";
+  if (polarity <= 30) return "restrictive";
+  return "neutral";
 }
 
 function confirmationSentence(
@@ -518,11 +539,9 @@ export function synthesize(inputs: ReadInputs): {
     raw.push(inverted);
   }
   if (inputs.confirmation) {
-    parts.push({
-      score: inputs.confirmation.score,
-      weight: READ.weights.confirmation,
-    });
-    raw.push(inputs.confirmation.score);
+    const polarity = confirmationPolarity(inputs.confirmation);
+    parts.push({ score: polarity, weight: READ.weights.confirmation });
+    raw.push(polarity);
   }
 
   const composite = weightedMean(parts);
