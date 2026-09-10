@@ -1,0 +1,18 @@
+node_modules/
+.next/
+out/
+build/
+.env
+.env.local
+*.tsbuildinfo
+next-env.d.ts
+.DS_Store
+
+# Netlify
+.netlify/
+
+# Generated data snapshots (published by the scheduled workflow)
+public/data/
+
+# Local scratch
+.scratch/

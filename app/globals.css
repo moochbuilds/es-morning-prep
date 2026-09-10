@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html {
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-base text-ink;
+    /* Numerals line up in columns across every card. */
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Restrained scrollbars — the page should feel calm. */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #262b33;
+    border-radius: 999px;
+    border: 3px solid #0b0d10;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #333944;
+  }
+}
+
+@layer components {
+  /* Section eyebrow: small, wide-tracked, muted. Used for every card title. */
+  .eyebrow {
+    @apply text-2xs font-medium uppercase tracking-[0.14em] text-ink-3;
+  }
+
+  /* Large readout numbers. */
+  .readout {
+    @apply font-mono tabular-nums tracking-tight;
+  }
+
+  .divider {
+    @apply border-t border-line-soft;
+  }
+}
