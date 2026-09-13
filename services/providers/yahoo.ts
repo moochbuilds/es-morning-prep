@@ -10,6 +10,9 @@ import "server-only";
  * surfaced with its own timestamp so the UI can show how old it really is.
  */
 
+import type { MarketSeries } from "@/lib/types";
+import { etParts } from "@/lib/engine/session";
+
 const BASE = "https://query1.finance.yahoo.com/v8/finance/chart/";
 
 const HEADERS = {
@@ -40,7 +43,6 @@ interface ChartResult {
     regularMarketPrice?: number;
     chartPreviousClose?: number;
     regularMarketTime?: number;
-    currency?: string;
   };
   timestamp?: number[];
   indicators?: {
@@ -54,58 +56,76 @@ interface ChartResult {
 }
 
 async function chart(symbol: string, query: string): Promise<ChartResult> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  try {
-    const res = await fetch(`${BASE}${encodeURIComponent(symbol)}?${query}`, {
-      headers: HEADERS,
-      signal: controller.signal,
-      cache: "no-store",
-    });
-    if (!res.ok) throw new Error(`Yahoo ${symbol}: HTTP ${res.status}`);
-    const json = await res.json();
-    const result = json?.chart?.result?.[0];
-    if (!result?.meta) {
-      throw new Error(
-        `Yahoo ${symbol}: ${json?.chart?.error?.description ?? "empty response"}`,
-      );
-    }
-    return result as ChartResult;
-  } finally {
-    clearTimeout(timer);
+  const res = await fetch(`${BASE}${encodeURIComponent(symbol)}?${query}`, {
+    headers: HEADERS,
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`Yahoo ${symbol}: HTTP ${res.status}`);
+  const json = await res.json();
+  const result = json?.chart?.result?.[0];
+  if (!result?.meta) {
+    throw new Error(`Yahoo ${symbol}: ${json?.chart?.error?.description ?? "empty response"}`);
   }
+  return result as ChartResult;
 }
 
 /**
- * Session change from the daily series.
+ * Daily history plus the latest quote, normalised to the MarketSeries
+ * contract: `closes` holds completed sessions only and ends with the close the
+ * latest price is measured against.
  *
- * `meta.chartPreviousClose` is range-dependent and wrong for futures, so we
- * derive the reference close from the daily bars instead: if the final bar is
- * the session currently quoted, the previous close is the bar before it.
+ * `meta.chartPreviousClose` is range-dependent and wrong for futures, so the
+ * reference close comes from the bars themselves. The last bar is the session
+ * currently quoted when its ET date matches the quote's, or its close matches
+ * the quote exactly.
  */
-export async function getQuote(symbol: string): Promise<Quote> {
-  const r = await chart(symbol, "range=5d&interval=1d");
-  const closes = (r.indicators?.quote?.[0]?.close ?? []).filter(
-    (c): c is number => typeof c === "number",
-  );
-  const price = r.meta.regularMarketPrice ?? closes[closes.length - 1];
-  if (typeof price !== "number" || closes.length < 2) {
+export async function getSeries(
+  symbol: string,
+  range = "1y",
+): Promise<MarketSeries & { previousClose: number }> {
+  const r = await chart(symbol, `range=${range}&interval=1d`);
+  const timestamps = r.timestamp ?? [];
+  const closes = r.indicators?.quote?.[0]?.close ?? [];
+
+  // One bar per ET date; Yahoo occasionally emits a partial duplicate.
+  const byDate = new Map<string, number>();
+  timestamps.forEach((t, i) => {
+    const c = closes[i];
+    if (typeof c === "number") byDate.set(etParts(t * 1000).key, c);
+  });
+  const bars = [...byDate.entries()].sort(([a], [b]) => (a < b ? -1 : 1));
+
+  const price = r.meta.regularMarketPrice ?? bars[bars.length - 1]?.[1];
+  if (typeof price !== "number" || bars.length < 3) {
     throw new Error(`Yahoo ${symbol}: insufficient price history`);
   }
+  const time = (r.meta.regularMarketTime ?? Math.floor(Date.now() / 1000)) * 1000;
 
-  const last = closes[closes.length - 1];
-  const isCurrentSession = Math.abs(last - price) < Math.abs(price) * 1e-6;
-  const previousClose = isCurrentSession
-    ? closes[closes.length - 2]
-    : closes[closes.length - 1];
+  const [lastDate, lastClose] = bars[bars.length - 1];
+  const isCurrent =
+    lastDate === etParts(time).key || Math.abs(lastClose - price) < Math.abs(price) * 1e-6;
+  const completed = isCurrent ? bars.slice(0, -1) : bars;
 
   return {
-    symbol,
     price,
-    previousClose,
-    changeAbs: price - previousClose,
-    changePct: ((price - previousClose) / previousClose) * 100,
-    time: (r.meta.regularMarketTime ?? Math.floor(Date.now() / 1000)) * 1000,
+    time: new Date(time).toISOString(),
+    dates: completed.map(([d]) => d),
+    closes: completed.map(([, c]) => c),
+    previousClose: completed[completed.length - 1][1],
+  };
+}
+
+/** Latest quote vs the prior session close. */
+export async function getQuote(symbol: string): Promise<Quote> {
+  const s = await getSeries(symbol, "5d");
+  return {
+    symbol,
+    price: s.price,
+    previousClose: s.previousClose,
+    changeAbs: s.price - s.previousClose,
+    changePct: ((s.price - s.previousClose) / s.previousClose) * 100,
+    time: Date.parse(s.time),
   };
 }
 
@@ -169,22 +189,16 @@ export async function mapPool<T, R>(
   return out;
 }
 
-/** Fetches many symbols, tolerating individual failures. */
-export async function getQuotes(
+/** Daily series for many symbols, tolerating individual failures. */
+export async function getSeriesMany(
   symbols: string[],
-): Promise<Map<string, Quote>> {
-  const settled = await mapPool(symbols, 8, getQuote);
-  const map = new Map<string, Quote>();
+  range: string,
+): Promise<Map<string, Awaited<ReturnType<typeof getSeries>>>> {
+  const settled = await mapPool(symbols, 8, (s) => getSeries(s, range));
+  const map = new Map<string, Awaited<ReturnType<typeof getSeries>>>();
   settled.forEach((s, i) => {
     if (s.status === "fulfilled") map.set(symbols[i], s.value);
-    else console.warn(`[yahoo] ${symbols[i]} failed:`, s.reason?.message ?? s.reason);
+    else console.warn(`[yahoo] ${symbols[i]} failed:`, (s.reason as Error)?.message ?? s.reason);
   });
   return map;
-}
-
-/** Oldest vendor timestamp in a set — what the freshness badge should reflect. */
-export function oldestTime(quotes: Iterable<Quote>): string {
-  let oldest = Infinity;
-  for (const q of quotes) oldest = Math.min(oldest, q.time);
-  return new Date(Number.isFinite(oldest) ? oldest : Date.now()).toISOString();
 }

@@ -1,39 +1,233 @@
 # ES Morning Prep
 
-A single-page morning dashboard for an S&P 500 futures trader. It answers seven
-questions in about thirty seconds:
+A market-environment interpreter for an intraday S&P 500 futures (ES) trader.
+Within 30–60 seconds it should answer:
 
-- What can move ES today?
-- Is the equity move broad and well-confirmed?
-- What sectors are leading and lagging?
-- Are rates, volatility and credit supportive or restrictive?
-- Are major earnings affecting the index or a key sector?
-- What is the overall regime and risk environment?
+1. What are rates saying?
+2. What is credit saying?
+3. What is volatility saying?
+4. How are equities positioned internally?
+5. Do those markets agree or disagree?
+6. What changed from the prior session?
+7. What does that imply about the environment ES is trading in?
 
-Every section follows **Data → Signal → Conclusion**: the underlying numbers are
-shown, but the interpretation is done for you.
+It provides **context, not trade signals**. Long/short decisions come from ES
+price action at important locations; the dashboard only says how much
+cross-market confirmation that price action has.
+
+There are **no composite scores**. Each market is classified on three questions
+— where is it, which way is it moving, and how unusual is that move against its
+own history — and the classifications are then compared. When markets disagree,
+the disagreement is reported, never averaged away.
 
 ---
 
-## Running it locally
+## The page
+
+| Row | Section | Answers |
+|---|---|---|
+| 1 | Header | Session state (open / pre-market / weekend / holiday), next trading session, ES/NQ/RTY, event risk |
+| 2 | **Today's Read** + **Vital Signs** | Market backdrop, signal alignment, main tailwind/headwind/divergence, a ≤4-sentence explanation, ES context, what changed since the prior session |
+| — | **Cross-market divergence** | Explicit disagreements, directly beneath Today's Read ("None significant" when there are none) |
+| 3 | **Rates & Yield Curve · Credit · Volatility** | The three vital signs in detail, one chart each |
+| 4 | **Equity Confirmation** | Equity posture, index participation, breadth, sector rotation vs SPY |
+| 5 | **Catalysts · Economic Releases** | One key takeaway, then the session's high-impact releases with forecast / previous (actual once printed) and the reading computed from them; second-tier and later releases as muted one-liners |
+
+Every classification label can be hovered to show its evidence ("Why bear
+steepening? 2Y +3 bp, 10Y +11 bp, 2s10s +8 bp…"), and every term of art has a
+small **i** with a one-line definition. The page is meant to teach while it is
+used.
+
+**Colour follows interpretation, never sign.** Green = constructive/confirming,
+red = deteriorating/stressed, amber = mixed/caution/background risk, gray =
+neutral. Treasury yields are never coloured by direction. Event risk is never
+green: LOW catalyst risk is not "good", it is just quiet.
+
+---
+
+## Architecture
+
+```
+DATA -> CALCULATIONS -> CLASSIFICATIONS -> CROSS-ASSET LOGIC -> TEXT EXPLANATION
+```
+
+The deterministic engine does everything up to the text. The language model
+only explains the engine's output; it never sees raw numbers alone and never
+decides a classification.
+
+```
+scripts/build-data.ts     The only code that calls providers. Writes public/data/*.json
+services/
+  blocks.ts               One cached adapter per raw block (10 blocks)
+  dashboard.ts            Parallel fetch -> engine -> (optional) AI explanation
+  providers/              Yahoo, Treasury, FRED, Cboe, TradingEconomics, Nasdaq, mock
+lib/
+  types.ts                Raw data contracts + engine output types
+  engine/
+    rates.ts              Curve shape, bull/bear steepening/flattening, 10Y driver, cycle backdrop
+    credit.ts             HY/IG level band, direction, speed vs history, quality breadth, HYG/LQD
+    volatility.ts         VIX regime, rate of change, term structure (futures or proxy)
+    equities.ts           Breadth, participation, rotation vs SPY, equity posture
+    synthesis.ts          Divergences, alignment, backdrop, tailwind/headwind, what changed, ES context
+    narrative.ts          Rule-based Today's Read + the language rules every narrative must pass
+    session.ts            NYSE holiday calendar, session phase, next/last session, quote labels
+    catalysts.ts          Event risk and next major catalyst (kept separate from market posture)
+    stats.ts              History ranking ("larger than 88% of 5-day moves")
+  synthetic.ts            Seeded synthetic market data for tests and mock mode
+  scenarios.ts            Named scenarios (reference, stress, credit-divergence, vol-shock)
+  ai.ts                   Explanation only, validated, with rule-based fallback
+config/
+  thresholds.ts           Every threshold the engine uses — no magic numbers in logic
+  glossary.ts             The definitions behind the "i" icons
+  universe.ts             Breadth universe and sector ETF proxies
+tests/                    Acceptance scenarios + engine and calendar tests (node:test)
+```
+
+---
+
+## How each market is read
+
+**Judged against its own history.** A move's "rank" is the share of that
+series' own same-length moves (over the past year, or three years for credit)
+that were smaller. Thresholds are ranks with fixed floors, so a very quiet
+regime can't promote a 1 bp wiggle, plus fixed fallbacks when history is short.
+
+### Rates & yield curve
+
+- **Shape**: 2s10s upward-sloping / flat (±20 bp) / inverted.
+- **Movement**: the 2s10s change must clear the noise gate, or the curve is
+  **STABLE** — nothing is forced from noise.
+- **Which leg moved**: the leading leg (larger absolute move) decides bull vs
+  bear. Front end falling fastest = bull steepening; long end rising fastest =
+  bear steepening; front end rising fastest = bear flattening; long end falling
+  fastest = bull flattening. Both legs moving together = parallel shift.
+- **Context**: a bull steepening reads as benign easing when credit and
+  volatility are calm and as a growth scare when they are not.
+- **10Y driver**: the 5-day nominal 10Y change is split into real yield (TIPS)
+  and breakeven: REAL YIELDS / INFLATION EXPECTATIONS / MIXED. Omitted when
+  real yields are unavailable.
+- **Inversion is background only**: shown as cycle context, never as a signal.
+
+The classification uses the official Treasury close-to-close curve (all tenors,
+one source, one date). There is no reliable keyless live 2Y, so live Cboe ^TNX
+is shown only as a labelled context line.
+
+### Credit
+
+HY OAS bands (<300 tight, 300–500 normal, 500–700 warning, 700–1000 stress,
+1000+ crisis) are context. **Direction and speed carry the signal**: the 5-day
+change is ranked against three years of 5-day changes → TIGHTENING / STABLE /
+WIDENING / RAPIDLY WIDENING. HY and IG are read separately, so the page says
+whether stress is confined to junk or broadening into investment grade.
+HYG/LQD is a faster, price-based proxy and is never ranked above actual spreads.
+
+### Volatility
+
+VIX regime (very calm / normal / elevated / high fear / extreme) plus rate of
+change (falling / stable / rising / spiking) plus **term structure**. Actual
+VX futures (M2 vs M1) are used when available; otherwise VIX9D/VIX/VIX3M,
+clearly labelled as a proxy. **Backwardation** outranks everything else. Low
+VIX is never read as bullish: it means calm now.
+
+### Equity confirmation
+
+- **Breadth** (% above VWAP, A/D, RSP vs SPY) is judged against the index's own
+  direction → BROAD / MIXED / NARROW / BROAD SELLING.
+- **Index participation** (ES/NQ/RTY, RSP vs SPY) → BROAD CONFIRMATION,
+  POSITIVE — LARGE-CAP LED, POSITIVE BUT NARROW, MIXED, BROAD WEAKNESS, …
+- **Sector rotation** is measured **relative to SPY** across all eleven GICS
+  sector ETFs plus semis: cyclical average (XLK, XLC, XLY, XLF, XLI, XLB) minus
+  defensive average (XLV, XLP, XLU) → STRONG / MILD RISK-ON ROTATION, NEUTRAL,
+  DEFENSIVE ROTATION. STRONG must be **broad** (most cyclicals beating SPY); a
+  spread carried by one or two sectors is capped at MILD and called
+  concentrated. Semis (inside XLK), energy (an inflation/geopolitical hedge)
+  and real estate (hybrid, rate-driven) are shown but kept out of the spread.
+  The XLY/XLP and XLF/XLU paired opposites appear in the evidence.
+- **Equity posture**: AGGRESSIVE RISK-ON / CONSTRUCTIVE / MIXED /
+  TRANSITIONING / DEFENSIVE ROTATION / RISK-OFF.
+
+Rotation is confirmation only. The equity lean handed to the cross-asset layer
+follows the ES tape first; rotation only decides it on a flat day.
+
+### Cross-asset logic
+
+Detected divergences: equity/credit, volatility/credit, volatility-only fear,
+rotation/credit, index participation, unconfirmed selloff, equity/volatility.
+
+The backdrop leads with the equity tape, then qualifies it by confirmation:
+BROADLY CONFIRMED RISK-ON, RISK-ON — CREDIT / VOLATILITY NOT CONFIRMING,
+RISK-ON — RATES HEADWIND, RISK-ON — UNEVEN PARTICIPATION, RISK-OFF — NOT
+BROADLY CONFIRMED, BROADLY CONFIRMED RISK-OFF / STRESS, MIXED / DIVERGENT, …
+
+Signal alignment is STRONG / MODERATE / MIXED — a statement about agreement,
+never a percentage.
+
+---
+
+## Data sources
+
+| Block | Source | Notes |
+|---|---|---|
+| ES / NQ / RTY | Yahoo (`ES=F`, `NQ=F`, `RTY=F`) | 1-day and 5-day changes |
+| Breadth | Yahoo 5-min bars for all ~503 S&P 500 members | Refuses to report below 90% coverage |
+| Sectors | Yahoo sector ETFs + SPY, 3 months daily | Relative performance and noise ranking |
+| Treasury curve | home.treasury.gov nominal + real par curves | 3M/2Y/5Y/10Y/30Y + 10Y TIPS, ~1 year |
+| Live 10Y | Cboe ^TNX via Yahoo | Context line only |
+| HY / IG OAS | FRED `BAMLH0A0HYM2`, `BAMLC0A0CM` | Daily, one-day lag, ~3 years |
+| HYG / LQD | Yahoo, 3 months daily | Faster proxy |
+| VIX, VIX9D, VIX3M | Cboe via Yahoo, 1 year daily | |
+| VX futures | cboe.com delayed futures quotes | Monthly contracts only |
+| Economic calendar | tradingeconomics.com, US, 2-star+ | Two weeks ahead |
+| Earnings | api.nasdaq.com ∩ S&P 500 membership | ≥ $200B market cap only |
+
+Only FRED needs a (free) key. Every source is labelled with what its numbers
+represent: "Live", "Fri close", or "As of Sep 10" for daily series.
+
+### Economic releases
+
+Every scheduled release is interpreted through the release library in
+[`config/releases.ts`](config/releases.ts): one of five primary categories
+(INFLATION, LABOR, GROWTH, FED, SENTIMENT) plus an optional secondary
+("Consumer Prices", "Wages", "Housing"…) and what a higher or lower reading
+means economically. Interest rates are the transmission from data to markets,
+never a category, and no meaning ever names an equity direction. Rows of one
+release are grouped (CPI's MoM, YoY and core rows become one CPI release).
+
+The meanings are applied automatically. Before the print a release shows
+**Forecast | Previous** and what the market expects to change ("Exp. vs prior:
+▲ stronger consumer demand"); after it, **Actual | Forecast | Previous** with
+the surprise ("▲ Above forecast → stronger inflation pressure"), judged against
+a per-release tolerance so rounding noise is not called a surprise. Forecast is
+the market consensus; TradingEconomics' own estimate is used only when no
+consensus exists, and is labelled.
+
+The section opens with a single computed **key takeaway**: a high-impact
+release that printed away from forecast, else the session's next high-impact
+release, else the next major catalyst. High-impact releases are bold rows;
+second-tier and later releases are muted one-liners, with categories and
+secondary figures on hover.
+
+**Current Macro Focus** is inferred from what rates and credit are repricing
+(a big front-end move → Fed easing expectations; credit widening → recession
+risk; …) and marks the releases that matter most that day. If nothing is being
+repriced it says so and names the next key scheduled test. **Scheduled event
+risk** is catalyst risk only, never a measure of market stress.
+
+**Sessions** come from a computed NYSE calendar (all holidays and observed
+dates, early closes). "Next session" is the next exchange trading day, never
+"the next day that has an economic release"; the next major catalyst is shown
+separately.
+
+---
+
+## Running it
 
 ```bash
 npm install
-npm run dev          # http://localhost:3000
+npm run dev          # http://localhost:3000, data refreshed every 2 minutes
+npm test             # engine, acceptance scenarios, calendar
+npm run typecheck
 ```
-
-`npm run dev` fetches a data snapshot first, then starts Next and refreshes the
-snapshot every two minutes, so the page behaves the way the published site does.
-
-Every source is keyless except FRED's credit spread, which needs a free key
-(`fredaccount.stlouisfed.org/apikey`). Put it in `.env.local`:
-
-```bash
-FRED_API_KEY=your-key
-```
-
-Without it the credit row falls back to FRED's CSV export, which FRED throttles
-aggressively, so expect it to show UNAVAILABLE some of the time.
 
 | Script | What it does |
 |---|---|
@@ -41,208 +235,78 @@ aggressively, so expect it to show UNAVAILABLE some of the time.
 | `npm run data` | Fetch every source once and write `public/data/*.json` |
 | `npm run build` | Static export to `out/` |
 | `npm run preview` | Serve `out/` locally |
-| `npm run typecheck` | `tsc --noEmit` |
+| `npm test` | Run the test suite |
 
-`DATA_MODE=mock` forces simulated data for offline UI work. Any section serving
-mock data is named in the header chip, so a partly-live page can't pass for a
-fully live one.
+`DATA_MODE=mock` serves synthetic data; `MOCK_SCENARIO` picks the story
+(`reference`, `stress`, `credit-divergence`, `vol-shock`). Any section serving
+mock data is named in the header.
 
----
+### Tests
 
-## Hosting: GitHub Pages, free with no metering
-
-The site is a **static export**. A scheduled GitHub Action fetches every source
-once, writes the result to `public/data/dashboard.json`, builds the site, and
-publishes it to GitHub Pages. Visitors download static files and never trigger a
-fetch.
-
-**Why it's built this way.** The first deployment ran on Netlify serverless
-functions. Every open tab called two functions every 45 seconds, and a cold call
-swept 500+ stock quotes, recomputing identical data for every viewer. That
-exhausted the free credits. Precomputing once per refresh removes the per-viewer
-cost entirely, so there is nothing left to meter.
-
-| | |
-|---|---|
-| Refresh cadence | Every 5 min on weekdays; every 30 min on weekends |
-| Cost | Free: Actions minutes are free for public repos, and Pages is free static hosting |
-| Page load | Instant, served from GitHub's CDN, with the latest snapshot embedded in the HTML |
-| Polling | The page checks for a newer snapshot every 60s (static file, no cost) |
-
-Schedule and publishing live in [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml).
-
-### Resilience built into the workflow
-
-- **Last known good.** Each run starts with no cache, so the data script reads
-  the currently published snapshot first. Any provider that fails this run is
-  carried forward from it, marked STALE with its original timestamp.
-- **Never publishes an empty page.** If every provider fails and there is
-  nothing to carry forward (e.g. a network problem on the runner), the job fails
-  and the live site is left untouched.
-- **Client-side ageing.** Freshness badges and the next-event countdown are
-  recomputed against the viewer's clock, not trusted from generation time. If
-  the refresh ever stops, cards degrade to DELAYED and then STALE, and a banner
-  says the snapshot is old. A dead pipeline can't masquerade as live data.
-- **Keepalive.** GitHub disables scheduled workflows in public repos after 60
-  days without commits, and Pages deploys aren't commits. A weekly check commits
-  a heartbeat file if the repo has been quiet for 45 days.
-
-### One-time setup
-
-1. Push the repo to GitHub as **public** (Pages on private repos needs a paid
-   plan). The repo contains no secrets; keys live only in GitHub Secrets.
-2. **Settings → Pages → Source: GitHub Actions.**
-3. **Settings → Secrets and variables → Actions:** add `FRED_API_KEY`
-   (and optionally `ANTHROPIC_API_KEY`).
-4. Run the workflow once from the Actions tab, or push to `main`.
-
-### Limits worth knowing
-
-- **Cadence is ~5 minutes, not seconds.** GitHub's scheduler can also start runs
-  several minutes late under load; minutes are offset from :00 to reduce that.
-  For a morning scan this rarely matters, and Yahoo's own CME quotes already lag
-  10–30 minutes.
-- Pages has a soft 100 GB/month bandwidth limit, which a personal dashboard
-  won't approach.
-
----
-
-## Architecture
-
-```
-scripts/
-  build-data.ts        The only code that calls providers. Writes public/data/*.json
-  dev.mjs              Local: refresh data every 2 min alongside `next dev`
-app/
-  page.tsx             Prerendered with the latest snapshot embedded
-components/            One component per dashboard section + ui/ primitives
-services/
-  futures.ts breadth.ts sectors.ts rates.ts volatility.ts credit.ts
-  calendar.ts earnings.ts     One adapter per domain, each returning Block<T>
-  dashboard.ts                Parallel fan-out + score derivation
-  mode.ts                     live | mock switch
-  providers/                  Yahoo, Treasury, FRED, TradingEconomics, Nasdaq,
-                              S&P 500 constituents, mock
-lib/
-  types.ts      Normalized internal contracts. The UI knows nothing else
-  scoring.ts    All score/classification logic (no magic numbers)
-  freshness.ts  Status from age; re-ages blocks against the viewer's clock
-  cache.ts      TTL cache with last-known-good and failure backoff
-  ai.ts         Anthropic calls, structured output, rule-based fallback
-  format.ts     Eastern Time + number formatting
-config/
-  thresholds.ts   Every weight, threshold and refresh interval
-  universe.ts     Breadth and earnings-relevance settings
-.github/workflows/deploy.yml   Scheduled refresh + Pages deploy + keepalive
-```
-
----
-
-## Where the data comes from
-
-All sources are refreshed together on each snapshot.
-
-| Section | Source |
-|---|---|
-| ES / NQ / RTY | Yahoo Finance (`ES=F`, `NQ=F`, `RTY=F`) |
-| VIX | Cboe `^VIX` via Yahoo |
-| 10Y yield + session bp move | Cboe `^TNX` via Yahoo |
-| 2Y yield, 2s10s | home.treasury.gov par yield curve (T-1) |
-| HY credit spread | FRED API, `BAMLH0A0HYM2` (daily, T-1) |
-| Breadth | **All ~503 S&P 500 constituents**, Yahoo 5-minute bars |
-| Sector rotation | Sector + semiconductor ETFs via Yahoo |
-| Economic calendar | tradingeconomics.com, US only, 2-star and above |
-| Earnings + EPS surprise | api.nasdaq.com |
-| S&P 500 membership | datahub constituents dataset |
-
-**Breadth is genuinely computed, not proxied.** Every constituent's session VWAP
-is derived from its own 5-minute bars (`Σ(typical price × volume) / Σ volume`);
-%-above-VWAP and the advance/decline ratio come from the full index. The sweep
-refuses to report below 90% coverage.
-
-**Earnings selection** answers "what could move the S&P today": Nasdaq's
-calendar is intersected with live S&P 500 membership, filtered to a $50B floor,
-and ranked by market cap. HIGH is reserved for $300B+. It is deliberately not
-"whatever is biggest today", since on a quiet week that could be a $70B REIT.
-Revenue, guidance and margins aren't published by any keyless source, so those
-rows are **omitted** rather than shown as N/A.
-
-**Calendar importance** is not TradingEconomics' star rating. Everything 2-star
-and above is shown, but HIGH is reserved for prints that actually move index
-futures (CPI, PPI, PCE, payrolls, claims, Fed, GDP, retail sales, ISM/PMI,
-long-end auctions). Otherwise a 3-star Existing Home Sales print would push the
-day's event risk to HIGH, which no ES trader would agree with.
-
-### Caveats
-
-- **Yahoo is unofficial and unlicensed**: undocumented, rate-limited at their
-  discretion, no SLA, not licensed for commercial use, and typically 10–30 min
-  delayed on CME futures. Fine for a personal morning scan; not something to
-  trade size against.
-- **TradingEconomics is scraped**, since their guest API was discontinued. The
-  parser is strict: if the markup changes it throws, and the card shows
-  UNAVAILABLE (or the last good calendar, marked STALE) rather than an empty list.
-- **Sector rotation has no day-over-day delta.** That needs yesterday's closing
-  score persisted somewhere; there's nothing honest to compare against yet, so
-  the line is hidden.
-
-### Swapping in a paid feed
-
-Each domain has exactly one place to wire a vendor: the corresponding function
-in `services/providers/live.ts`. Implement the body and return the normalized
-type from `lib/types.ts`. **No call site and no component changes.** A slot that
-throws `NotConfiguredError` falls back to labelled mock; any other failure
-propagates so the block degrades to STALE or UNAVAILABLE. A real outage is never
-papered over with simulated data.
-
----
-
-## Scoring
-
-All of it lives in [`config/thresholds.ts`](config/thresholds.ts).
-`lib/scoring.ts` reads that config and contains no constants of its own, so the
-model can be re-tuned without touching logic.
-
-| Score | Range | Driven by |
-|---|---|---|
-| **Market Stress** | 0 calm → 100 severe | VIX 40%, 10Y move 30%, HY spread 25%, 2s10s 5% (weights shown in the card) |
-| **Breadth** | 0 → 100 | % above VWAP 40%, A/D 35%, RSP-vs-SPY 25% |
-| **Sector Rotation** | 0 defensive → 100 risk-on | Weighted cyclical average minus defensive average |
-| **Confirmation** | STRONG…DIVERGENT | Sign agreement across ES/NQ/RTY |
-| **Event Risk** | LOW/MED/HIGH | Importance points plus a concentration bonus for clustered high-impact events |
-
-If an input is unavailable, a composite renormalizes across the inputs it has,
-and the card lists the weights actually used.
-
-Two conventions:
-
-- **2s10s is 10Y minus 2Y.** Positive is upward-sloping. It gets low weight
-  deliberately, since it says little about today's ES tape.
-- **Colour follows interpretation, not sign.** A −6bp move in the 10Y renders
-  green because falling yields support equities.
-
-These are decision-support heuristics, not calibrated models, and the UI says so.
+`tests/acceptance.test.ts` encodes the eight acceptance scenarios from the
+specification (bull/bear steepening, volatility-only fear, credit widening
+under calm volatility, broadly confirmed stress, narrow large-cap strength,
+rotation/credit divergence, and Saturday → Monday session with a Tuesday
+catalyst). They run the full engine on synthetic data with a year of realistic
+noise, so the history-ranked thresholds are exercised as they are live.
 
 ---
 
 ## AI usage
 
-AI is used for interpretation only. It never produces a market data point.
+Optional. With `ANTHROPIC_API_KEY` set, the model writes the Today's Read
+paragraph from the engine's computed facts. The output must pass the same
+rules as the rule-based writer — at most four sentences, no trade-direction
+language — or the rule-based text is used. A narrative is only displayed for
+the snapshot it was written about, and it is reused while every
+classification is unchanged, so a 5-minute refresh is not a 5-minute model
+call. Without a key, the deterministic writer runs and no request is made.
 
-The model receives already-computed scores and classifications and phrases them.
-Output is constrained by a JSON schema, the classification fields are overwritten
-with our own values after the response, and the prompt forbids trade
-recommendations.
+---
 
-With `ANTHROPIC_API_KEY` unset (locally or in GitHub Secrets), `ruleBasedRead()`
-in `lib/scoring.ts` produces the same shape deterministically. The card is never
-empty.
+## Hosting: GitHub Pages, free with no metering
+
+The site is a static export. A scheduled GitHub Action runs the tests, fetches
+every source once, writes `public/data/*.json`, builds the site and publishes
+it to Pages. Visitors download static files and never trigger a fetch.
+
+| | |
+|---|---|
+| Refresh cadence | Every 5 min on weekdays; every 30 min on weekends |
+| Cost | Free: Actions minutes are free for public repos, and Pages is free static hosting |
+| Page load | Served from GitHub's CDN, with the latest snapshot embedded in the HTML |
+| Polling | The page checks for a newer snapshot every 60s (static file, no cost) |
+
+Resilience:
+
+- **Last known good.** A provider that fails is carried forward from the
+  published snapshot, marked STALE with its original timestamp — but only from
+  a snapshot with the same schema version.
+- **Never publishes an empty page.** If every provider fails, the job fails and
+  the live site is left untouched.
+- **Client-side ageing.** Freshness, session state and the next-catalyst
+  countdown are recomputed against the viewer's clock.
+- **Keepalive.** A weekly check commits a heartbeat if the repo has been quiet
+  for 45 days, so GitHub doesn't disable the schedule.
+
+One-time setup: push as a public repo; **Settings → Pages → Source: GitHub
+Actions**; add `FRED_API_KEY` (and optionally `ANTHROPIC_API_KEY`) under
+**Settings → Secrets and variables → Actions**.
+
+### Caveats
+
+- Yahoo is unofficial and unlicensed, and CME quotes are typically 10–30
+  minutes delayed. Fine for context; not something to trade size against.
+- TradingEconomics is scraped. If its markup changes the calendar shows
+  UNAVAILABLE rather than an empty list.
+- Treasury and FRED series are end-of-day. During the session the curve and
+  spreads describe the prior close, and are labelled with their date.
 
 ---
 
 ## Deliberately not included
 
-Support/resistance and overnight high/low levels (handled on the charts),
-McClellan/TRIN/additional breadth variants, full sector charts, the complete
-economic and earnings calendars, and any second page. The dashboard is meant to
-stay scannable in thirty seconds.
+Support/resistance and overnight levels (handled on the charts), additional
+breadth variants, VVIX/skew, full sector tables, the complete economic and
+earnings calendars, and any composite score. The dashboard answers the seven
+questions above and nothing else.

@@ -1,42 +1,48 @@
 import "server-only";
 
 /**
- * Live provider implementations.
+ * Live provider implementations. Each returns the normalized type from
+ * lib/types.ts; swapping in a paid vendor means replacing one function body.
  *
- * Implemented keyless (Yahoo Finance + US Treasury): futures, breadth, sectors,
- * rates, volatility.
- *
- * Still unimplemented — no credible keyless source exists: credit spreads (needs
- * a free FRED key), the economic calendar, and earnings. Those throw
- * NotConfiguredError, which the service layer turns into a labelled mock so the
- * rest of the dashboard keeps working.
+ *   Futures, VIX family, sectors, HYG/LQD, breadth   Yahoo (unofficial, delayed)
+ *   Treasury curve (nominal + real)                  home.treasury.gov
+ *   Credit spreads (HY + IG OAS)                     FRED
+ *   VX futures                                       Cboe
+ *   Economic calendar                                TradingEconomics
+ *   Earnings                                         Nasdaq
  */
 
+import { EARNINGS_CFG } from "@/config/thresholds";
 import {
   BREADTH_CONCURRENCY,
   BREADTH_MIN_COVERAGE,
   EARNINGS_RELEVANCE,
 } from "@/config/universe";
+import { SECTOR_PROXIES } from "@/config/universe";
+import { etParts, prevTradingDay, sessionInfo } from "@/lib/engine/session";
 import type {
   Breadth,
-  Credit,
+  CalendarEvent,
+  CreditData,
+  CreditProxy,
   Earnings,
   EarningsEvent,
   EarningsResult,
   IndexFutures,
-  Rates,
-  ResultGrade,
-  SectorQuote,
+  MarketSeries,
+  RatesData,
   Sectors,
-  Volatility,
+  VixFutures,
+  VolatilityData,
 } from "@/lib/types";
 
-import { getIntradayQuote, getQuote, getQuotes, mapPool } from "./yahoo";
-import { getParYields } from "./treasury";
+import { getVixFutures } from "./cboe";
 import { getConstituents, normalizeTicker } from "./constituents";
-import { getHighYieldSpread } from "./fred";
+import { getCreditSpreads } from "./fred";
 import { getEarningsCalendarFor, getLatestEpsSurprise } from "./nasdaq";
 import { getUsCalendar } from "./tradingeconomics";
+import { getCurveHistory } from "./treasury";
+import { getIntradayQuote, getQuote, getSeries, getSeriesMany, mapPool } from "./yahoo";
 
 export class NotConfiguredError extends Error {
   constructor(what: string, envVar: string) {
@@ -45,44 +51,47 @@ export class NotConfiguredError extends Error {
   }
 }
 
-/** YYYY-MM-DD in Eastern Time. */
-function etDateKey(d = new Date()): string {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/New_York",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(d);
+const round = (v: number, dp: number): number => Math.round(v * 10 ** dp) / 10 ** dp;
+
+/** Change vs the reference close `lag` sessions back, in percent. */
+function changeOver(s: MarketSeries, lag: number): number | null {
+  const base = s.closes[s.closes.length - lag];
+  return base ? round((s.price / base - 1) * 100, 2) : null;
 }
+
+const toMarketSeries = ({ price, time, dates, closes }: MarketSeries): MarketSeries => ({
+  price,
+  time,
+  dates,
+  closes,
+});
 
 // ---------------------------------------------------------------------------
 // Index futures — CME front-month continuous via Yahoo
 // ---------------------------------------------------------------------------
 
-const FUTURES_SYMBOLS = {
-  ES: { symbol: "ES=F", name: "E-mini S&P 500" },
-  NQ: { symbol: "NQ=F", name: "E-mini Nasdaq 100" },
-  RTY: { symbol: "RTY=F", name: "E-mini Russell 2000" },
-} as const;
+const FUTURES = [
+  { key: "ES", symbol: "ES=F", name: "E-mini S&P 500" },
+  { key: "NQ", symbol: "NQ=F", name: "E-mini Nasdaq 100" },
+  { key: "RTY", symbol: "RTY=F", name: "E-mini Russell 2000" },
+] as const;
 
 export async function liveFutures(): Promise<IndexFutures> {
-  const [es, nq, rty] = await Promise.all(
-    (["ES", "NQ", "RTY"] as const).map((k) => getQuote(FUTURES_SYMBOLS[k].symbol)),
-  );
-
-  const leg = (key: "ES" | "NQ" | "RTY", q: Awaited<ReturnType<typeof getQuote>>) => ({
-    symbol: key,
-    name: FUTURES_SYMBOLS[key].name,
-    last: round(q.price, 2),
-    changePct: round(q.changePct, 2),
-    changeAbs: round(q.changeAbs, 2),
-  });
-
-  return { es: leg("ES", es), nq: leg("NQ", nq), rty: leg("RTY", rty) };
+  const series = await Promise.all(FUTURES.map((f) => getSeries(f.symbol, "1mo")));
+  const [es, nq, rty] = series.map((s, i) => ({
+    symbol: FUTURES[i].key,
+    name: FUTURES[i].name,
+    last: round(s.price, 2),
+    changePct: round((s.price / s.previousClose - 1) * 100, 2),
+    changeAbs: round(s.price - s.previousClose, 2),
+    change5dPct: changeOver(s, 5),
+  }));
+  const quoteTime = series.map((s) => s.time).sort()[series.length - 1];
+  return { es, nq, rty, quoteTime };
 }
 
 // ---------------------------------------------------------------------------
-// Breadth — computed over the S&P 100 (see config/universe.ts for the caveat)
+// Breadth — computed over every S&P 500 constituent
 // ---------------------------------------------------------------------------
 
 export async function liveBreadth(): Promise<Breadth> {
@@ -95,230 +104,200 @@ export async function liveBreadth(): Promise<Breadth> {
 
   const coverage = quotes.length / universe.length;
   if (coverage < BREADTH_MIN_COVERAGE) {
-    throw new Error(
-      `Breadth coverage too low: ${quotes.length}/${universe.length} constituents returned.`,
-    );
+    throw new Error(`Breadth coverage too low: ${quotes.length}/${universe.length} constituents returned.`);
   }
 
   const withVwap = quotes.filter((q) => q.vwap !== null);
   const aboveVwap = withVwap.filter((q) => q.price > (q.vwap as number)).length;
-
   const advancers = quotes.filter((q) => q.changePct > 0).length;
   const decliners = quotes.filter((q) => q.changePct < 0).length;
 
   const [spy, rsp] = await Promise.all([getQuote("SPY"), getQuote("RSP")]);
 
   return {
-    pctAboveVwap: withVwap.length
-      ? Math.round((aboveVwap / withVwap.length) * 100)
-      : 50,
+    pctAboveVwap: withVwap.length ? Math.round((aboveVwap / withVwap.length) * 100) : 50,
     // Guard the unchanged-tape case so the ratio never divides by zero.
     advanceDeclineRatio: round(advancers / Math.max(1, decliners), 2),
     advancers,
     decliners,
+    spyChangePct: round(spy.changePct, 2),
+    rspChangePct: round(rsp.changePct, 2),
     rspVsSpyPct: round(rsp.changePct - spy.changePct, 2),
+    quoteTime: new Date(spy.time).toISOString(),
   };
 }
 
 // ---------------------------------------------------------------------------
-// Sectors — ETF proxies
+// Sectors — ETF proxies, measured against SPY
 // ---------------------------------------------------------------------------
-
-const SECTOR_PROXIES: Array<Pick<SectorQuote, "key" | "label" | "proxy">> = [
-  { key: "semis", label: "Semiconductors", proxy: "SOXX" },
-  { key: "tech", label: "Technology", proxy: "XLK" },
-  { key: "financials", label: "Financials", proxy: "XLF" },
-  { key: "industrials", label: "Industrials", proxy: "XLI" },
-  { key: "discretionary", label: "Discretionary", proxy: "XLY" },
-  { key: "energy", label: "Energy", proxy: "XLE" },
-  { key: "materials", label: "Materials", proxy: "XLB" },
-  { key: "healthcare", label: "Healthcare", proxy: "XLV" },
-  { key: "staples", label: "Staples", proxy: "XLP" },
-  { key: "utilities", label: "Utilities", proxy: "XLU" },
-];
 
 export async function liveSectors(): Promise<Sectors> {
-  const quotes = await getQuotes(SECTOR_PROXIES.map((s) => s.proxy));
+  const symbols = [...SECTOR_PROXIES.map((s) => s.proxy), "SPY"];
+  const series = await getSeriesMany(symbols, "3mo");
 
-  const sectors: SectorQuote[] = SECTOR_PROXIES.flatMap((s) => {
-    const q = quotes.get(s.proxy);
-    return q ? [{ ...s, changePct: round(q.changePct, 2) }] : [];
+  const spy = series.get("SPY");
+  if (!spy) throw new Error("Sector data: SPY unavailable");
+
+  const sectors = SECTOR_PROXIES.flatMap((s) => {
+    const q = series.get(s.proxy);
+    return q
+      ? [{ ...s, changePct: round((q.price / q.previousClose - 1) * 100, 2), change5dPct: changeOver(q, 5) }]
+      : [];
   });
+  if (sectors.length < SECTOR_PROXIES.length - 2) throw new Error("Sector data incomplete");
 
-  if (sectors.length < SECTOR_PROXIES.length - 2) {
-    throw new Error("Sector data incomplete");
+  // Align completed closes on dates every symbol shares.
+  const present = symbols.filter((s) => series.has(s));
+  const shared = spy.dates.filter((d) => present.every((s) => series.get(s)!.dates.includes(d)));
+  const closes: Record<string, number[]> = {};
+  for (const s of present) {
+    const ser = series.get(s)!;
+    const byDate = new Map(ser.dates.map((d, i) => [d, ser.closes[i]]));
+    closes[s] = shared.map((d) => byDate.get(d) as number);
   }
 
-  // The prior session's rotation score would need yesterday's sector closes
-  // stored; without a datastore there is nothing honest to compare against.
-  return { sectors, previousScore: null };
-}
-
-// ---------------------------------------------------------------------------
-// Rates — 10Y intraday from Cboe ^TNX, 2Y from Treasury par yields
-// ---------------------------------------------------------------------------
-
-export async function liveRates(): Promise<Rates> {
-  const [tnx, par] = await Promise.all([getQuote("^TNX"), getParYields()]);
-
-  const us10y = round(tnx.price, 2);
-  const us10yChangeBp = Math.round((tnx.price - tnx.previousClose) * 100);
-  const us2y = round(par.us2y, 2);
-
   return {
-    us10y,
-    us10yChangeBp,
-    us2y,
-    us2yChangeBp: par.us2yChangeBp,
-    // Small cross-source basis (Cboe index vs par yield); 2s10s carries only
-    // 5% of the stress score and is read as level + direction, not precision.
-    curve2s10sBp: Math.round((us10y - us2y) * 100),
-    curve2s10sChangeBp: us10yChangeBp - par.us2yChangeBp,
+    sectors,
+    spy: { changePct: round((spy.price / spy.previousClose - 1) * 100, 2), change5dPct: changeOver(spy, 5) },
+    history: { dates: shared, closes },
+    quoteTime: [...series.values()].map((s) => s.time).sort()[0],
   };
 }
 
 // ---------------------------------------------------------------------------
-// Volatility — spot VIX
+// Rates — official Treasury curve; Cboe ^TNX only as a live 10Y context line
 // ---------------------------------------------------------------------------
 
-export async function liveVolatility(): Promise<Volatility> {
-  const q = await getQuote("^VIX");
+export async function liveRates(): Promise<RatesData> {
+  const [history, tnx] = await Promise.all([
+    getCurveHistory(),
+    getQuote("^TNX").catch(() => null),
+  ]);
+
+  // Only show the live 10Y when it carries information the official curve
+  // doesn't yet have (a session after the curve's last date).
+  const lastCurveDate = history[history.length - 1].date;
+  const live10y =
+    tnx && etParts(tnx.time).key > lastCurveDate
+      ? {
+          yield: round(tnx.price, 3),
+          changeBp: Math.round((tnx.price - tnx.previousClose) * 100),
+          time: new Date(tnx.time).toISOString(),
+        }
+      : null;
+
+  return { history, live10y };
+}
+
+// ---------------------------------------------------------------------------
+// Credit
+// ---------------------------------------------------------------------------
+
+export async function liveCredit(): Promise<CreditData> {
+  return getCreditSpreads();
+}
+
+export async function liveCreditProxy(): Promise<CreditProxy> {
+  const [hyg, lqd] = await Promise.all([getSeries("HYG", "3mo"), getSeries("LQD", "3mo")]);
+  return { hyg: toMarketSeries(hyg), lqd: toMarketSeries(lqd) };
+}
+
+// ---------------------------------------------------------------------------
+// Volatility — VIX with a year of history, plus the 9-day and 3-month indices
+// ---------------------------------------------------------------------------
+
+export async function liveVolatility(): Promise<VolatilityData> {
+  const [vix, vix9d, vix3m] = await Promise.all([
+    getSeries("^VIX", "1y"),
+    getSeries("^VIX9D", "1y").catch(() => null),
+    getSeries("^VIX3M", "1y").catch(() => null),
+  ]);
   return {
-    vix: round(q.price, 2),
-    vixChangePct: round(q.changePct, 2),
-    vixChangeAbs: round(q.changeAbs, 2),
+    vix: toMarketSeries(vix),
+    vix9d: vix9d && toMarketSeries(vix9d),
+    vix3m: vix3m && toMarketSeries(vix3m),
   };
 }
 
-// ---------------------------------------------------------------------------
-// Credit — ICE BofA US High Yield OAS via FRED's keyless CSV export
-// ---------------------------------------------------------------------------
-
-export async function liveCredit(): Promise<Credit> {
-  return getHighYieldSpread();
+export async function liveVixFutures(): Promise<VixFutures> {
+  return getVixFutures();
 }
 
 // ---------------------------------------------------------------------------
-// Economic calendar — TradingEconomics, US only, 2-star and above
+// Economic calendar
 // ---------------------------------------------------------------------------
 
-export { getUsCalendar as liveCalendarResult };
-
-export async function liveCalendar() {
-  return (await getUsCalendar()).events;
+export async function liveCalendar(): Promise<CalendarEvent[]> {
+  return getUsCalendar();
 }
 
 // ---------------------------------------------------------------------------
-// Earnings — Nasdaq calendar, restricted to S&P 500 members and ranked by size
+// Earnings — only S&P 500 members large enough to move the index
 // ---------------------------------------------------------------------------
-
-function importanceForCap(cap: number | null) {
-  return (cap ?? 0) >= EARNINGS_RELEVANCE.highImpactMarketCap
-    ? ("HIGH" as const)
-    : ("MED" as const);
-}
 
 export async function liveEarnings(): Promise<Earnings> {
   const members = await getConstituents();
-  const today = etDateKey();
+  const session = sessionInfo(Date.now());
+  const forDate = session.nextSession;
 
-  // "Big impact on the S&P" = actually in the index, and big enough to matter.
-  const relevantOn = async (date: string) => {
-    const rows = await getEarningsCalendarFor(date).catch(() => []);
-    return rows
-      .flatMap((r) => {
-        const member = members.get(normalizeTicker(r.symbol));
-        if (!member || !r.slot) return [];
-        if ((r.marketCapUsd ?? 0) < EARNINGS_RELEVANCE.minMarketCap) return [];
-        return [{ row: r, member }];
-      })
-      .sort((a, b) => (b.row.marketCapUsd ?? 0) - (a.row.marketCapUsd ?? 0));
-  };
+  const rows = await getEarningsCalendarFor(forDate).catch(() => []);
+  const upcoming: EarningsEvent[] = rows
+    .flatMap((r) => {
+      const member = members.get(normalizeTicker(r.symbol));
+      if (!member || !r.slot) return [];
+      if ((r.marketCapUsd ?? 0) < EARNINGS_CFG.marketMovingCapUsd) return [];
+      return [{
+        ticker: r.symbol,
+        company: member.name || r.name,
+        slot: r.slot,
+        sector: member.sector,
+        marketCapUsd: r.marketCapUsd,
+      }];
+    })
+    .sort((a, b) => (b.marketCapUsd ?? 0) - (a.marketCapUsd ?? 0))
+    .slice(0, EARNINGS_CFG.maxShown);
 
-  // Weekends and holidays have nothing scheduled; fall forward to the next
-  // session so the card is useful on a Sunday-evening prep, same as catalysts.
-  let relevant = await relevantOn(today);
-  for (let ahead = 1; relevant.length === 0 && ahead <= 4; ahead++) {
-    relevant = await relevantOn(etDateKey(new Date(Date.now() + ahead * 86_400_000)));
-  }
-
-  const todayEvents: EarningsEvent[] = relevant.map(({ row, member }) => ({
-    ticker: row.symbol,
-    company: member.name || row.name,
-    slot: row.slot as EarningsEvent["slot"],
-    importance: importanceForCap(row.marketCapUsd),
-    sector: member.sector,
-    marketCapUsd: row.marketCapUsd,
-    epsForecast: row.epsForecast,
-  }));
-
-  return { today: todayEvents, reported: await recentlyReported(members, today) };
+  return { forDate, upcoming, reported: await recentlyReported(members, forDate) };
 }
 
 /**
- * Names that reported since the prior close. EPS beat/miss is real (actual vs
- * consensus); revenue, guidance and margins are not published by any keyless
- * source, so they stay N/A and the UI omits those rows entirely.
+ * Index-moving names that reported since the prior session's close. The EPS
+ * surprise feed is the proof a report happened: a name on the calendar that
+ * hasn't printed yet has no fresh row there, so it is filtered out by date.
  */
 async function recentlyReported(
   members: Awaited<ReturnType<typeof getConstituents>>,
-  today: string,
+  forDate: string,
 ): Promise<EarningsResult[]> {
-  const prior = new Date(Date.now() - EARNINGS_RELEVANCE.reportedLookbackDays * 86_400_000);
-  const priorKey = etDateKey(prior);
-
-  const candidates = (
-    await Promise.all(
-      [priorKey, today].map((d) => getEarningsCalendarFor(d).catch(() => [])),
-    )
-  )
+  const dates = [prevTradingDay(forDate), forDate];
+  const candidates = (await Promise.all(dates.map((d) => getEarningsCalendarFor(d).catch(() => []))))
     .flat()
-    .flatMap((r) => {
-      const member = members.get(normalizeTicker(r.symbol));
-      if (!member) return [];
-      if ((r.marketCapUsd ?? 0) < EARNINGS_RELEVANCE.highImpactMarketCap) return [];
-      return [{ r, member }];
-    })
-    .sort((a, b) => (b.r.marketCapUsd ?? 0) - (a.r.marketCapUsd ?? 0))
-    .slice(0, EARNINGS_RELEVANCE.maxReportedShown * 3);
+    .filter((r) => members.has(normalizeTicker(r.symbol)))
+    .filter((r) => (r.marketCapUsd ?? 0) >= EARNINGS_CFG.marketMovingCapUsd)
+    .sort((a, b) => (b.marketCapUsd ?? 0) - (a.marketCapUsd ?? 0))
+    .slice(0, EARNINGS_CFG.maxReportedShown * 2);
 
   const settled = await Promise.all(
-    candidates.map(async ({ r, member }): Promise<EarningsResult | null> => {
+    candidates.map(async (r): Promise<EarningsResult | null> => {
       const [surprise, quote] = await Promise.all([
         getLatestEpsSurprise(r.symbol),
         getQuote(r.symbol).catch(() => null),
       ]);
-      // The surprise feed is the proof the report actually happened. A name on
-      // today's calendar that hasn't printed yet has no fresh row here, so
-      // stale quarters are filtered out by date rather than guessed at.
       if (!surprise || !isRecent(surprise.dateReported)) return null;
-
-      const grade: ResultGrade =
-        surprise.surprisePct > 1 ? "BEAT" : surprise.surprisePct < -1 ? "MISS" : "IN LINE";
-
+      const member = members.get(normalizeTicker(r.symbol));
       return {
         ticker: r.symbol,
-        company: member.name || r.name,
-        sector: member.sector,
+        company: member?.name || r.name,
         reportedAt: surprise.dateReported,
-        revenue: "N/A",
-        eps: grade,
-        guidance: "N/A",
-        margins: "N/A",
-        epsDetail: {
-          actual: surprise.eps,
-          consensus: surprise.consensus,
-          surprisePct: surprise.surprisePct,
-        },
+        epsSurprisePct: surprise.surprisePct,
         stockReactionPct: quote ? round(quote.changePct, 2) : null,
-        missingFields: ["revenue", "guidance", "margins"],
       };
     }),
   );
 
   return settled
     .filter((r): r is EarningsResult => r !== null)
-    .slice(0, EARNINGS_RELEVANCE.maxReportedShown);
+    .slice(0, EARNINGS_CFG.maxReportedShown);
 }
 
 /** Nasdaq reports dates as M/D/YYYY. Accept only the last few days. */
@@ -327,10 +306,5 @@ function isRecent(dateReported: string): boolean {
   if (!m) return false;
   const when = Date.UTC(Number(m[3]), Number(m[1]) - 1, Number(m[2]));
   const ageDays = (Date.now() - when) / 86_400_000;
-  return ageDays >= -1 && ageDays <= EARNINGS_RELEVANCE.reportedLookbackDays + 1.5;
+  return ageDays >= -1 && ageDays <= EARNINGS_RELEVANCE.reportedLookbackDays + 3;
 }
-
-// ---------------------------------------------------------------------------
-
-const round = (v: number, dp: number): number =>
-  Math.round(v * 10 ** dp) / 10 ** dp;

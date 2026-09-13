@@ -5,7 +5,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "ES Morning Prep",
   description:
-    "Thirty-second morning read on the S&P 500 futures environment: catalysts, breadth, rotation, stress and confirmation.",
+    "Market-environment interpreter for an intraday ES trader: what rates, credit, volatility and equity internals are saying, where they agree, and where they disagree.",
 };
 
 export const viewport: Viewport = {

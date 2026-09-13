@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { Dashboard } from "@/components/Dashboard";
-import type { DashboardData, Interpretation } from "@/lib/types";
+import { SCHEMA_VERSION, type DashboardData, type Interpretation } from "@/lib/types";
 
 /**
  * Prerendered with the latest snapshot embedded, so the first paint has real
@@ -11,10 +11,7 @@ import type { DashboardData, Interpretation } from "@/lib/types";
  */
 async function readSnapshot<T>(file: string): Promise<T | null> {
   try {
-    const raw = await readFile(
-      path.join(process.cwd(), "public", "data", file),
-      "utf8",
-    );
+    const raw = await readFile(path.join(process.cwd(), "public", "data", file), "utf8");
     return JSON.parse(raw) as T;
   } catch {
     // No snapshot yet: the client shows a waiting state and polls for one.
@@ -27,5 +24,12 @@ export default async function Page() {
     readSnapshot<DashboardData>("dashboard.json"),
     readSnapshot<Interpretation>("interpretation.json"),
   ]);
-  return <Dashboard initialData={data} initialInterpretation={interpretation} />;
+  // A snapshot written by an older version of the app has a different shape.
+  const current = data?.schemaVersion === SCHEMA_VERSION ? data : null;
+  return (
+    <Dashboard
+      initialData={current}
+      initialInterpretation={current ? interpretation : null}
+    />
+  );
 }

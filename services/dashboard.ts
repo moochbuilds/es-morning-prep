@@ -1,108 +1,60 @@
 import "server-only";
 
+import { generateNarrative } from "@/lib/ai";
+import { analyze } from "@/lib/engine";
+import { SCHEMA_VERSION, type DashboardData, type Interpretation, type RawBlocks } from "@/lib/types";
+
 import {
-  scoreBreadth,
-  scoreConfirmation,
-  scoreEventRisk,
-  scoreRotation,
-  scoreStress,
-  type ReadInputs,
-} from "@/lib/scoring";
-import type { DashboardData, Interpretation } from "@/lib/types";
-
+  getBreadth,
+  getCalendar,
+  getCredit,
+  getCreditProxy,
+  getEarnings,
+  getIndexFutures,
+  getRates,
+  getSectors,
+  getVixFutures,
+  getVolatility,
+} from "./blocks";
 import { dataMode } from "./mode";
-import { getIndexFutures } from "./futures";
-import { getBreadth } from "./breadth";
-import { getSectorRotation } from "./sectors";
-import { getRates } from "./rates";
-import { getVolatility } from "./volatility";
-import { getCreditConditions } from "./credit";
-import { getEconomicCalendar } from "./calendar";
-import { getEarningsCalendar } from "./earnings";
-import { aiEnabled, attachEarningsTakeaways, generateTodayRead } from "@/lib/ai";
-
-type ScoredBlocks = Pick<
-  DashboardData,
-  "futures" | "breadth" | "sectors" | "rates" | "volatility" | "credit" | "calendar"
->;
 
 /**
- * Scores are pure functions of the blocks, so they can be re-derived whenever a
- * block is replaced (e.g. a failed provider carried forward from the last
- * published snapshot).
+ * Fetches every block in parallel. Blocks fail independently — `cached()`
+ * never throws — so one dead provider degrades one section, not the page.
  */
-export function deriveScores(
-  blocks: ScoredBlocks,
-  now: number,
-): DashboardData["derived"] {
-  return {
-    stress: scoreStress(blocks.rates.data, blocks.volatility.data, blocks.credit.data),
-    breadth: scoreBreadth(blocks.breadth.data),
-    rotation: scoreRotation(blocks.sectors.data),
-    confirmation: scoreConfirmation(blocks.futures.data),
-    eventRisk: scoreEventRisk(blocks.calendar.data, now),
-  };
-}
-
-/**
- * Fetches every block in parallel and derives the scores.
- *
- * Blocks fail independently — `cached()` never throws, so one dead provider
- * degrades a single card rather than the page. Deliberately does NOT call the
- * AI layer: structured numbers are produced first, interpretation follows.
- */
-export async function getDashboardData(): Promise<DashboardData> {
-  const [futures, breadth, sectors, rates, volatility, credit, calendar, earnings] =
+export async function fetchBlocks(): Promise<RawBlocks> {
+  const [futures, breadth, sectors, rates, credit, creditProxy, volatility, vixFutures, calendar, earnings] =
     await Promise.all([
       getIndexFutures(),
       getBreadth(),
-      getSectorRotation(),
+      getSectors(),
       getRates(),
+      getCredit(),
+      getCreditProxy(),
       getVolatility(),
-      getCreditConditions(),
-      getEconomicCalendar(),
-      getEarningsCalendar(),
+      getVixFutures(),
+      getCalendar(),
+      getEarnings(),
     ]);
+  return { futures, breadth, sectors, rates, credit, creditProxy, volatility, vixFutures, calendar, earnings };
+}
 
-  const now = Date.now();
-  const blocks = { futures, breadth, sectors, rates, volatility, credit, calendar };
-
+/** Numbers first, then the deterministic engine. No model call happens here. */
+export async function getDashboardData(): Promise<DashboardData> {
+  const blocks = await fetchBlocks();
   return {
-    generatedAt: new Date(now).toISOString(),
+    schemaVersion: SCHEMA_VERSION,
+    generatedAt: new Date().toISOString(),
     mode: dataMode(),
     ...blocks,
-    earnings,
-    derived: deriveScores(blocks, now),
+    analysis: analyze(blocks),
   };
 }
 
-/** Reassembles the AI-layer inputs from an already-fetched payload. */
-export function readInputsFrom(data: DashboardData): ReadInputs {
-  return {
-    breadth: data.derived.breadth,
-    rotation: data.derived.rotation,
-    stress: data.derived.stress,
-    confirmation: data.derived.confirmation,
-    eventRisk: data.derived.eventRisk,
-    futures: data.futures.data,
-    rates: data.rates.data,
-    volatility: data.volatility.data,
-  };
-}
-
-/** Everything that needs the model, computed after the numbers. */
-export async function getInterpretation(
+/** The explanation layer, computed after the numbers and classifications. */
+export function getInterpretation(
   data: DashboardData,
+  previous: Interpretation | null,
 ): Promise<Interpretation> {
-  const [read, reported] = await Promise.all([
-    generateTodayRead(readInputsFrom(data)),
-    attachEarningsTakeaways(data.earnings.data?.reported ?? []),
-  ]);
-
-  const takeaways: Record<string, string> = {};
-  for (const r of reported) {
-    if (r.takeaway) takeaways[r.ticker] = r.takeaway;
-  }
-
-  return { read, takeaways, aiConfigured: aiEnabled() };
+  return generateNarrative(data.analysis, previous);
 }

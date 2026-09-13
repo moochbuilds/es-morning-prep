@@ -24,61 +24,68 @@ const longDateFmt = new Intl.DateTimeFormat("en-US", {
   day: "numeric",
 });
 
-const shortDateFmt = new Intl.DateTimeFormat("en-US", {
-  timeZone: ET_ZONE,
-  month: "short",
-  day: "numeric",
-});
-
 export function etTime(iso: string | number | Date): string {
-  return timeFmt.format(new Date(iso)).replace(/ /g, " ");
+  return timeFmt.format(new Date(iso)).replace(/ /g, " ");
 }
 
 export function etTimeWithSeconds(iso: string | number | Date): string {
-  return timeWithSecondsFmt.format(new Date(iso)).replace(/ /g, " ");
+  return timeWithSecondsFmt.format(new Date(iso)).replace(/ /g, " ");
 }
 
 export function etLongDate(iso: string | number | Date): string {
   return longDateFmt.format(new Date(iso));
 }
 
-export function etShortDate(iso: string | number | Date): string {
-  return shortDateFmt.format(new Date(iso));
-}
-
-/** "+0.42%" / "-1.30%" — always signed, always 2dp. */
-/** YYYY-MM-DD in Eastern Time — for "is this actually today?" comparisons. */
-export function etDateKey(iso: string | number | Date = new Date()): string {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: ET_ZONE,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(new Date(iso));
-}
-
-/** "Mon, Aug 10" — used when catalysts belong to the next session. */
-export function etWeekdayShort(iso: string | number | Date): string {
+/** "Sep 10" from a YYYY-MM-DD observation date (no timezone shift). */
+export function dateKeyLabel(key: string): string {
+  const [y, m, d] = key.split("-").map(Number);
   return new Intl.DateTimeFormat("en-US", {
-    timeZone: ET_ZONE,
-    weekday: "short",
+    timeZone: "UTC",
     month: "short",
     day: "numeric",
-  }).format(new Date(iso));
+  }).format(new Date(Date.UTC(y, m - 1, d)));
 }
 
+const MINUS = "−";
+
+/** Rounds first so a tiny negative never renders as "−0.00". */
+function signOf(rounded: number): string {
+  return rounded > 0 ? "+" : rounded < 0 ? MINUS : "";
+}
+
+/** "+0.42%" / "−1.30%" */
 export function pct(value: number, digits = 2): string {
-  return `${value >= 0 ? "+" : "-"}${Math.abs(value).toFixed(digits)}%`;
+  const r = Number(value.toFixed(digits));
+  return `${signOf(r)}${Math.abs(r).toFixed(digits)}%`;
 }
 
-/** "+32 bp" / "-6 bp" */
+/** "+32 bp" / "−6 bp" / "0 bp" */
 export function bp(value: number): string {
-  const rounded = Math.round(value);
-  return `${rounded >= 0 ? "+" : "-"}${Math.abs(rounded)} bp`;
+  const r = Math.round(value);
+  return `${signOf(r)}${Math.abs(r)} bp`;
+}
+
+/** Unsigned level: "270 bp" */
+export function bpLevel(value: number): string {
+  return `${Math.round(value)} bp`;
+}
+
+/** Relative performance in percentage points: "+0.50 pts" */
+export function pts(value: number, digits = 2): string {
+  const r = Number(value.toFixed(digits));
+  return `${signOf(r)}${Math.abs(r).toFixed(digits)} pts`;
 }
 
 export function yieldPct(value: number): string {
   return `${value.toFixed(2)}%`;
+}
+
+/** 1 -> "1st", 22 -> "22nd", 38 -> "38th" */
+export function ordinal(n: number): string {
+  const r = Math.round(n);
+  const tens = r % 100;
+  if (tens >= 11 && tens <= 13) return `${r}th`;
+  return `${r}${["th", "st", "nd", "rd"][r % 10] ?? "th"}`;
 }
 
 export function ratio(value: number): string {
@@ -88,9 +95,14 @@ export function ratio(value: number): string {
 export function minutesLabel(minutes: number): string {
   if (minutes < 0) return "now";
   if (minutes < 60) return `${minutes} min`;
-  const h = Math.floor(minutes / 60);
-  const m = minutes % 60;
-  return m === 0 ? `${h}h` : `${h}h ${m}m`;
+  if (minutes < 24 * 60) {
+    const h = Math.floor(minutes / 60);
+    const m = minutes % 60;
+    return m === 0 ? `${h}h` : `${h}h ${m}m`;
+  }
+  const d = Math.floor(minutes / (24 * 60));
+  const h = Math.floor((minutes % (24 * 60)) / 60);
+  return h === 0 ? `${d}d` : `${d}d ${h}h`;
 }
 
 /** Elapsed-time label for freshness footers: "12s ago", "4 min ago". */
@@ -100,5 +112,7 @@ export function ago(iso: string | null, now: number): string {
   if (seconds < 60) return `${seconds}s ago`;
   const minutes = Math.round(seconds / 60);
   if (minutes < 60) return `${minutes} min ago`;
-  return `${Math.round(minutes / 60)}h ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
 }

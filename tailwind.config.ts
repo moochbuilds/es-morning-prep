@@ -5,7 +5,9 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        // Surfaces
+        // Surfaces. NOTE: because a colour is named "base", `text-base` also
+        // sets the text colour to the page background — use `text-[15px]`
+        // (or another explicit size) for 16px-ish text, never `text-base`.
         base: "#0B0D10",
         surface: "#13161B",
         "surface-2": "#181C22",

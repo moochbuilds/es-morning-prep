@@ -1,17 +1,24 @@
 import "server-only";
 
-import type { CalendarEvent, Importance } from "@/lib/types";
+import type { CalendarEvent } from "@/lib/types";
+import { etInstant, etParts } from "@/lib/engine/session";
 
 /**
  * TradingEconomics US economic calendar.
  *
  * Scraped from the public calendar page — TE discontinued its guest API key.
  * The parser is deliberately strict: if the page markup changes it throws, so
- * the card degrades to UNAVAILABLE rather than silently rendering nothing.
+ * the section degrades to UNAVAILABLE rather than silently rendering nothing.
  *
- * Two facts established by checking known release schedules:
- *   - Importance is encoded as `calendar-date-N` on the time span (3 = red).
+ * Facts established by checking known release schedules:
+ *   - The star rating is encoded as `calendar-date-N` on the time span.
  *   - Times are UTC. CPI shows 12:30, which is 08:30 ET. We convert.
+ *   - Each row carries actual, previous (plus any revision), consensus and
+ *     TE's own model forecast. Consensus is the market's expectation; TE's
+ *     forecast is kept separately and used only when no consensus exists.
+ *
+ * Importance, category and grouping are NOT decided here: the release library
+ * (config/releases.ts) does that in the engine, so there is one source of truth.
  */
 
 const URL = "https://tradingeconomics.com/united-states/calendar";
@@ -23,41 +30,17 @@ const HEADERS = {
   "Accept-Language": "en-US,en;q=0.9",
 };
 
-/**
- * Releases that actually move US equity index futures.
- *
- * This list — not TradingEconomics' star rating — decides what counts as HIGH.
- * TE stars reflect general macro significance, so a 3-star print like Existing
- * Home Sales would otherwise push the day's event risk to HIGH even though ES
- * barely notices it. Everything 2-star and above is still SHOWN; this only
- * governs which events are treated as genuinely dangerous.
- */
-const MARKET_MOVERS = [
-  // Inflation
-  "inflation rate", "core inflation", "cpi", "ppi", "pce",
-  // Labour
-  "non farm payrolls", "nonfarm", "unemployment rate", "average hourly earnings",
-  "initial jobless claims", "jolts", "adp employment change",
-  // Fed
-  "fed interest rate decision", "fomc", "fed press conference", "fed chair",
-  "powell", "beige book",
-  // Growth and activity
-  "gdp growth", "retail sales", "ism manufacturing", "ism services",
-  "pmi", "durable goods", "consumer confidence", "michigan consumer sentiment",
-  "philadelphia fed", "empire state", "chicago pmi",
-];
+/** Far enough ahead to always find the next major catalyst. */
+const LOOKAHEAD_DAYS = 14;
 
-/** Auctions matter at the long end, where they can reprice the curve. */
-const AUCTION_MOVERS = [
-  "10-year note auction",
-  "20-year bond auction",
-  "30-year bond auction",
-];
+/** TE rates events 1-3 stars; below this they are excluded. */
+const MIN_STARS = 2;
 
 const strip = (s: string): string =>
   s.replace(/<[^>]*>/g, " ")
     .replace(/&nbsp;/g, " ")
     .replace(/&amp;/g, "&")
+    .replace(/®/g, "")
     .replace(/\s+/g, " ")
     .trim();
 
@@ -65,7 +48,7 @@ function titleCase(slug: string): string {
   return slug
     .split(" ")
     .map((w) =>
-      /^(cpi|ppi|pce|gdp|ism|api|eia|mba|jolts|adp|fomc|us|yoy|mom|qoq|s\.a)$/i.test(w)
+      /^(cpi|ppi|pce|gdp|ism|api|eia|mba|jolts|adp|fomc|us|ny|nahb|cb|yoy|mom|qoq|s\.a)$/i.test(w)
         ? w.toUpperCase()
         : w.charAt(0).toUpperCase() + w.slice(1),
     )
@@ -96,69 +79,58 @@ function toInstant(date: string, time: string): string | null {
 interface RawRow {
   date: string;
   time: string;
-  importance: number;
+  stars: number;
   country: string;
   slug: string;
-  category: string;
+  title: string;
+  period: string | null;
+  actual: string | null;
+  previous: string | null;
+  consensus: string | null;
+  forecast: string | null;
+}
+
+/** Text of the element with this id inside a row, or null when empty. */
+function cell(row: string, id: string): string | null {
+  const m = row.match(new RegExp(`id=['"]${id}['"][^>]*>([^<]*)<`));
+  const value = m ? strip(m[1]) : "";
+  return value || null;
 }
 
 function parseRows(html: string): RawRow[] {
-  const rows = html.match(/<tr\b[^>]*data-event=[\s\S]*?<\/tr>/g) ?? [];
+  // Split on row starts. Each row nests a small flag <table>, so a lazy
+  // "<tr ... </tr>" match would stop inside it, before the value cells.
+  const rows = html.split(/(?=<tr\b[^>]*data-event=)/).slice(1);
   return rows.flatMap((r) => {
-    const attr = (k: string) =>
-      (r.match(new RegExp(`data-${k}="([^"]*)"`)) || [])[1] ?? "";
+    const attr = (k: string) => (r.match(new RegExp(`data-${k}="([^"]*)"`)) || [])[1] ?? "";
     const dateCell = r.match(/<td[^>]*class='\s*(\d{4}-\d{2}-\d{2})'/);
-    const timeSpan = r.match(
-      /<span class="[^"]*calendar-date-(\d)[^"]*">([^<]*)<\/span>/,
-    );
+    const timeSpan = r.match(/<span class="[^"]*calendar-date-(\d)[^"]*">([^<]*)<\/span>/);
     if (!dateCell || !timeSpan) return [];
+    const slug = attr("event").toLowerCase();
+    const title = strip((r.match(/class='calendar-event'[^>]*>([^<]*)</) || [])[1] ?? "");
+    const period = strip((r.match(/class="calendar-reference">([^<]*)</) || [])[1] ?? "");
     return [{
       date: dateCell[1],
       time: strip(timeSpan[2]),
-      importance: Number(timeSpan[1]),
+      stars: Number(timeSpan[1]),
       country: attr("country"),
-      slug: attr("event").toLowerCase(),
-      category: attr("category").toLowerCase(),
+      slug,
+      title: title || titleCase(slug),
+      period: period || null,
+      actual: cell(r, "actual"),
+      // A revision to the prior reading replaces it: that is what the market compares against.
+      previous: cell(r, "revised") ?? cell(r, "previous"),
+      consensus: cell(r, "consensus"),
+      forecast: cell(r, "forecast"),
     }];
   });
 }
 
-function importanceOf(row: RawRow): Importance | null {
-  // "ADP Employment Change Weekly" is a different, much lower-impact series
-  // than the monthly print. Initial Jobless Claims is weekly but isn't named
-  // that way, so it keeps its HIGH standing.
-  const isWeeklyVariant = /\bweekly\b/.test(row.slug);
-
-  const isMover =
-    !isWeeklyVariant &&
-    (MARKET_MOVERS.some((k) => row.slug.includes(k)) ||
-      AUCTION_MOVERS.some((k) => row.slug.includes(k)));
-
-  // HIGH is reserved for prints that move ES, not for everything TE stars red.
-  if (isMover && row.importance >= 2) return "HIGH";
-  if (row.importance >= 2) return "MED";
-  return null; // 1-star and below: excluded per the 2-star floor.
-}
-
-/** Today's ET calendar date, as YYYY-MM-DD. */
-function etDateKey(d = new Date()): string {
-  const p = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/New_York",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(d);
-  return p;
-}
-
-export interface CalendarResult {
-  events: CalendarEvent[];
-  /** ET date the events belong to — today, or the next session if today is empty. */
-  forDate: string;
-  isToday: boolean;
-}
-
-export async function getUsCalendar(): Promise<CalendarResult> {
+/**
+ * Every US event of two stars and up, from the start of today (ET) through
+ * the lookahead window, including releases that have already printed.
+ */
+export async function getUsCalendar(): Promise<CalendarEvent[]> {
   const res = await fetch(URL, {
     headers: HEADERS,
     cache: "no-store",
@@ -171,70 +143,34 @@ export async function getUsCalendar(): Promise<CalendarResult> {
     throw new Error("TradingEconomics: no calendar rows parsed (markup changed?)");
   }
 
-  const scored = raw
-    .filter((r) => r.country === "united states")
+  const events = raw
+    .filter((r) => r.country === "united states" && r.stars >= MIN_STARS)
     .flatMap((r) => {
-      const importance = importanceOf(r);
       const time = toInstant(r.date, r.time);
-      if (!importance || !time) return [];
+      if (!time) return [];
       return [{
-        // ET date can differ from TE's UTC date (e.g. a 00:30 UTC print).
-        etDate: etDateKey(new Date(time)),
-        event: {
-          id: `${r.date}-${r.slug}`.replace(/\s+/g, "-"),
-          time,
-          title: titleCase(r.slug),
-          importance,
-          category: categorize(r.slug),
-        } satisfies CalendarEvent,
-      }];
+        id: `${r.date}-${r.slug}`.replace(/\s+/g, "-"),
+        time,
+        title: r.title,
+        importance: "MED",
+        category: categorize(r.slug),
+        key: r.slug,
+        period: r.period,
+        actual: r.actual,
+        consensus: r.consensus,
+        modelForecast: r.forecast,
+        previous: r.previous,
+      } satisfies CalendarEvent];
     });
 
-  if (scored.length === 0) throw new Error("TradingEconomics: no US events matched");
+  if (events.length === 0) throw new Error("TradingEconomics: no US events matched");
 
-  const today = etDateKey();
-  const upcoming = [...new Set(scored.map((s) => s.etDate))]
-    .filter((d) => d >= today)
-    .sort();
-
-  // Weekends and holidays have no US releases; fall forward to the next session
-  // rather than showing an empty card, and label which day it is.
-  const forDate = scored.some((s) => s.etDate === today)
-    ? today
-    : (upcoming[0] ?? today);
-
-  const dayEvents = scored
-    .filter((s) => s.etDate === forDate)
-    .map((s) => s.event)
-    .sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
-
-  return { events: dedupe(dayEvents), forDate, isToday: forDate === today };
-}
-
-/**
- * TE lists each release once per series (CPI publishes MoM, YoY, Core MoM,
- * Core YoY, plus a raw index). Collapse to one line per release time + family,
- * keeping the highest-importance variant, so the card stays scannable.
- */
-function dedupe(events: CalendarEvent[]): CalendarEvent[] {
-  const rank: Record<Importance, number> = { HIGH: 3, MED: 2, LOW: 1 };
-  const best = new Map<string, CalendarEvent>();
-
-  for (const e of events) {
-    const family = e.title
-      .toLowerCase()
-      .replace(/\b(mom|yoy|qoq|s\.a|adv|prel|final|core)\b/g, "")
-      .replace(/[^a-z ]/g, "")
-      .trim()
-      .split(" ")
-      .slice(0, 2)
-      .join(" ");
-    const key = `${e.time}|${family}`;
-    const prev = best.get(key);
-    if (!prev || rank[e.importance] > rank[prev.importance]) best.set(key, e);
-  }
-
-  return [...best.values()].sort(
-    (a, b) => new Date(a.time).getTime() - new Date(b.time).getTime(),
-  );
+  const from = etInstant(etParts(Date.now()).key, 0);
+  const to = Date.now() + LOOKAHEAD_DAYS * 86_400_000;
+  return events
+    .filter((e) => {
+      const t = Date.parse(e.time);
+      return t >= from && t <= to;
+    })
+    .sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
 }

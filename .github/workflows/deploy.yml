@@ -41,6 +41,11 @@ jobs:
 
       - run: npm ci
 
+      # The engine decides every classification on the page; a regression must
+      # never publish.
+      - name: Test engine
+        run: npm test
+
       - id: pages
         uses: actions/configure-pages@v5
 

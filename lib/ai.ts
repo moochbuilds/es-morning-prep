@@ -3,22 +3,25 @@ import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
 
 import { REFRESH } from "@/config/thresholds";
-import { ruleBasedRead, synthesize, type ReadInputs } from "./scoring";
-import type { EarningsResult, Regime, RiskLevel, TodayRead } from "./types";
+import { languageViolation, sentenceCount } from "./engine/narrative";
+import type { Analysis, Interpretation } from "./types";
 
 /**
- * AI is used for INTERPRETATION ONLY.
+ * AI is used for EXPLANATION ONLY.
  *
- * The model never sees a blank canvas: it receives the already-computed scores
- * and classifications and is asked to phrase them. It cannot introduce a number
- * that the scoring layer did not produce, and every field it returns is either
- * a constrained enum or free text that we length-check.
+ * The deterministic engine (lib/engine) has already classified every market,
+ * detected every divergence and chosen the backdrop. The model receives those
+ * computed facts and writes the Today's Read paragraph — it never sees a blank
+ * canvas and never decides a classification. Its output is checked against the
+ * same language rules as the rule-based writer (no trade direction, at most
+ * four sentences); anything that fails falls back to the rule-based text.
  *
- * With no ANTHROPIC_API_KEY the deterministic writer in scoring.ts runs instead,
- * so the card is never empty and the app is fully usable offline.
+ * With no ANTHROPIC_API_KEY the rule-based text is used and no request is made.
  */
 
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-5";
+const MAX_SENTENCES = 5;
+const MAX_CHARS = 1100;
 
 let client: Anthropic | null | undefined;
 
@@ -32,290 +35,158 @@ export function aiEnabled(): boolean {
   return getClient() !== null;
 }
 
-// ---------------------------------------------------------------------------
-// Today's Read
-// ---------------------------------------------------------------------------
-
-const READ_SCHEMA = {
+const SCHEMA = {
   type: "object",
   properties: {
-    regime: { type: "string", enum: ["RISK-ON", "NEUTRAL", "RISK-OFF"] },
-    confidence: { type: "integer" },
-    breadth: { type: "string" },
-    rotation: { type: "string" },
-    stress: { type: "string" },
-    confirmation: { type: "string" },
     summary: {
       type: "string",
-      description: "Two to three sentences describing the environment.",
-    },
-    mainRisk: {
-      type: "string",
-      description: "One sentence naming the single largest risk to the setup.",
+      description: "At most four sentences of plain prose.",
     },
   },
-  required: [
-    "regime",
-    "confidence",
-    "breadth",
-    "rotation",
-    "stress",
-    "confirmation",
-    "summary",
-    "mainRisk",
-  ],
+  required: ["summary"],
   additionalProperties: false,
 } as const;
 
-const SYSTEM_PROMPT = `You write the morning market read for a professional S&P 500 futures trader.
+const SYSTEM_PROMPT = `You write the "Today's Read" paragraph on a market-context dashboard used by an intraday S&P 500 futures (ES) trader.
 
-You receive pre-computed scores and classifications. Your job is to phrase them, not to recompute them.
+You receive facts already computed by a deterministic engine: classifications for rates, credit, volatility and equity internals, the cross-asset backdrop, detected divergences, and what changed since the prior session. Explain what those facts mean together. Do not recompute or reclassify anything, and do not introduce a number, market or event that is not in the input.
+
+Organise the paragraph around four questions: what changed, what confirms it, what contradicts it, and what that means for the environment ES is trading in. Write at most four sentences.
 
 Rules:
-- Never invent or estimate a market data point. Use only the numbers provided.
-- Never make a trade recommendation. Do not write "buy", "sell", "long", "short", or "fade". Describe the environment instead.
-- summary: 2-3 sentences. Name the drivers, then say whether the backdrop is constructive, balanced, or defensive, and flag event risk if it is HIGH.
-- mainRisk: exactly one sentence naming the single most likely thing that breaks the current setup.
-- Echo the breadth, rotation, stress and confirmation classifications back verbatim as given.
-- Set regime and confidence to the supplied values unless the data plainly contradicts them.
-- Write plainly. No hedging filler, no bullet points, no headings.`;
+- Describe relationships, not mechanics: "yields are rising alongside equities", "consistent with", "suggests", "is confirming", "is not confirming". Never claim one market causes or reinforces another.
+- When rates matter, say which part of the curve is moving and, if the input names one, whether real yields or inflation expectations are driving the 10Y.
+- If markets disagree, name exactly what disagrees. Never smooth a disagreement into an average reading, and never write filler such as "markets are showing mixed signals".
+- This is context, not a trade signal. Never recommend a trade or a direction: no buy, sell, long, short, fade, entries, targets or stops.
+- Do not mention scheduled events or event risk; they are shown separately.
+- No headings, bullet points or hedging filler.`;
 
-/** Compact, model-facing view of the dashboard. Numbers only, no prose. */
-function buildReadPayload(inputs: ReadInputs) {
-  const { breadth, rotation, stress, confirmation, eventRisk } = inputs;
-  const { regime, confidence } = synthesize(inputs);
-
+/** The engine's facts, compact and model-facing. */
+function facts(a: Analysis) {
+  const s = a.synthesis;
+  const e = a.equities;
   return {
-    computed: { regime, confidence },
-    futures: inputs.futures && {
-      esChangePct: inputs.futures.es.changePct,
-      nqChangePct: inputs.futures.nq.changePct,
-      rtyChangePct: inputs.futures.rty.changePct,
+    backdrop: s.backdrop.label,
+    signalAlignment: { state: s.alignment.state, explanation: s.alignment.text },
+    mainTailwind: s.tailwind,
+    mainHeadwind: s.headwind,
+    divergences: s.divergences.map((d) => ({ title: d.title, detail: d.detail, severity: d.severity })),
+    whatChanged: s.whatChanged.map((w) => `${w.market}: ${w.fact} -> ${w.implication}`),
+    rates: a.rates && {
+      curveMove5d: a.rates.trend.move,
+      curveMoveDescription: a.rates.trend.description,
+      lastSessionMove: a.rates.session.move,
+      shape: a.rates.shape,
+      tenYearDriver: a.rates.driver?.driver ?? "not available",
+      interpretation: a.rates.vital.interpretation,
+      cycleBackdrop: a.rates.cycle.text,
+      asOf: a.rates.asOf,
     },
-    breadth: breadth && {
-      classification: breadth.classification,
-      score: breadth.score,
-      inputs: breadth.components.map((c) => ({
-        label: c.label,
-        score: Math.round(c.score),
-      })),
+    credit: a.credit && {
+      state: a.credit.state,
+      hyOasBp: a.credit.hy.level,
+      hyBand: a.credit.hy.band,
+      hyDirection: a.credit.hy.direction,
+      igDirection: a.credit.ig?.direction ?? null,
+      quality: a.credit.quality?.text ?? null,
+      interpretation: a.credit.vital.interpretation,
+      asOf: a.credit.hy.asOf,
     },
-    rotation: rotation && {
-      classification: rotation.classification,
-      score: rotation.score,
-      changeVsPriorSession: rotation.change,
-      leaders: rotation.leaders.map((s) => `${s.label} ${s.changePct}%`),
-      laggards: rotation.laggards.map((s) => `${s.label} ${s.changePct}%`),
+    creditProxy: a.creditProxy && { hygVsLqd: a.creditProxy.state },
+    volatility: a.volatility && {
+      state: a.volatility.state,
+      vix: a.volatility.vix.level,
+      regime: a.volatility.regime,
+      momentum: a.volatility.momentum,
+      termStructure: a.volatility.term?.state ?? null,
+      termStructureSource: a.volatility.term?.source ?? null,
+      interpretation: a.volatility.vital.interpretation,
     },
-    stress: stress && {
-      classification: stress.classification,
-      score: stress.score,
-    },
-    rates: inputs.rates && {
-      us10y: inputs.rates.us10y,
-      us10yChangeBp: inputs.rates.us10yChangeBp,
-      curve2s10sBp: inputs.rates.curve2s10sBp,
-    },
-    volatility: inputs.volatility && {
-      vix: inputs.volatility.vix,
-      vixChangePct: inputs.volatility.vixChangePct,
-    },
-    confirmation: confirmation && {
-      classification: confirmation.classification,
-      note: confirmation.interpretation,
-    },
-    eventRisk: {
-      level: eventRisk.level,
-      rationale: eventRisk.rationale,
-      nextEvent: eventRisk.nextEvent && {
-        title: eventRisk.nextEvent.event.title,
-        importance: eventRisk.nextEvent.event.importance,
-        minutesAway: eventRisk.nextEvent.minutesAway,
+    equities: {
+      posture: e.posture,
+      postureExplanation: e.explanation,
+      participation: e.participation && { state: e.participation.state, explanation: e.participation.explanation },
+      breadth: e.breadth && { state: e.breadth.state, explanation: e.breadth.explanation },
+      rotation: e.rotation && {
+        state: e.rotation.state,
+        explanation: e.rotation.explanation,
+        leadersVsSpy: e.rotation.leaders.map((l) => `${l.label} ${l.relPct}`),
+        laggardsVsSpy: e.rotation.laggards.map((l) => `${l.label} ${l.relPct}`),
       },
     },
+    esContext: s.esContext,
   };
 }
 
-interface ReadCacheEntry {
-  read: TodayRead;
-  at: number;
-  signature: string;
+/** Null when the text is usable; otherwise the reason it was rejected. */
+function rejection(text: string): string | null {
+  if (!text) return "empty";
+  if (text.length > MAX_CHARS) return "too long";
+  if (sentenceCount(text) > MAX_SENTENCES) return "too many sentences";
+  const bad = languageViolation(text);
+  return bad ? `trade language ("${bad}")` : null;
 }
 
-let readCache: ReadCacheEntry | null = null;
+/**
+ * Writes Today's Read. `previous` is the last published narrative: when the
+ * engine's classifications are unchanged it is reused, so a snapshot every few
+ * minutes doesn't mean a model call every few minutes.
+ */
+export async function generateNarrative(
+  a: Analysis,
+  previous: Interpretation | null = null,
+): Promise<Interpretation> {
+  const rule: Interpretation = {
+    signature: a.signature,
+    text: a.narrative,
+    generatedBy: "rule",
+    generatedAt: new Date().toISOString(),
+    aiConfigured: aiEnabled(),
+  };
 
-/** Regenerate only when a classification actually moved. */
-function readSignature(inputs: ReadInputs): string {
-  return [
-    inputs.breadth?.classification,
-    inputs.rotation?.classification,
-    inputs.stress?.classification,
-    inputs.confirmation?.classification,
-    inputs.eventRisk.level,
-    inputs.eventRisk.nextEvent?.event.id,
-  ].join("|");
-}
-
-export async function generateTodayRead(inputs: ReadInputs): Promise<TodayRead> {
-  const fallback = ruleBasedRead(inputs);
   const anthropic = getClient();
-  if (!anthropic) return fallback;
+  if (!anthropic) return rule;
 
-  const signature = readSignature(inputs);
   if (
-    readCache &&
-    readCache.signature === signature &&
-    Date.now() - readCache.at < REFRESH.aiRead
+    previous?.generatedBy === "ai" &&
+    previous.signature === a.signature &&
+    Date.now() - Date.parse(previous.generatedAt) < REFRESH.aiRead
   ) {
-    return readCache.read;
+    return { ...previous, aiConfigured: true };
   }
 
   try {
     const response = await anthropic.beta.messages.create({
       model: MODEL,
-      max_tokens: 8000,
+      max_tokens: 16000,
       betas: ["server-side-fallback-2026-07-01"],
       fallbacks: "default",
       system: SYSTEM_PROMPT,
       output_config: {
-        effort: "low",
-        format: { type: "json_schema", schema: READ_SCHEMA },
+        effort: "medium",
+        format: { type: "json_schema", schema: SCHEMA },
       },
-      messages: [
-        {
-          role: "user",
-          content: JSON.stringify(buildReadPayload(inputs), null, 2),
-        },
-      ],
+      messages: [{ role: "user", content: JSON.stringify(facts(a), null, 2) }],
     });
 
     if (response.stop_reason === "refusal") {
       console.error("[ai] Today's Read declined by safety classifiers.");
-      return fallback;
+      return rule;
     }
 
-    const text = response.content.find((b) => b.type === "text");
-    if (!text || text.type !== "text") return fallback;
+    const block = response.content.find((b) => b.type === "text");
+    if (!block || block.type !== "text") return rule;
 
-    const parsed = JSON.parse(text.text) as {
-      regime: Regime;
-      confidence: number;
-      breadth: string;
-      rotation: string;
-      stress: string;
-      confirmation: string;
-      summary: string;
-      mainRisk: string;
-    };
+    const text = (JSON.parse(block.text) as { summary: string }).summary.trim();
+    const reason = rejection(text);
+    if (reason) {
+      console.warn(`[ai] Today's Read rejected (${reason}); using rule-based text.`);
+      return rule;
+    }
 
-    const read: TodayRead = {
-      regime: parsed.regime,
-      confidence: Math.max(0, Math.min(100, Math.round(parsed.confidence))),
-      // Classifications are ours, not the model's — never let phrasing drift.
-      breadth: fallback.breadth,
-      rotation: fallback.rotation,
-      stress: fallback.stress,
-      confirmation: fallback.confirmation,
-      eventRisk: inputs.eventRisk.level as RiskLevel,
-      summary: parsed.summary.trim(),
-      mainRisk: parsed.mainRisk.trim(),
-      generatedBy: "ai",
-      generatedAt: new Date().toISOString(),
-    };
-
-    readCache = { read, at: Date.now(), signature };
-    return read;
+    return { ...rule, text, generatedBy: "ai" };
   } catch (error) {
     console.error("[ai] Today's Read generation failed:", error);
-    return fallback;
+    return rule;
   }
-}
-
-// ---------------------------------------------------------------------------
-// Earnings takeaways
-// ---------------------------------------------------------------------------
-
-const TAKEAWAY_SCHEMA = {
-  type: "object",
-  properties: {
-    takeaway: {
-      type: "string",
-      description: "At most two sentences on the read-through for ES.",
-    },
-  },
-  required: ["takeaway"],
-  additionalProperties: false,
-} as const;
-
-const TAKEAWAY_PROMPT = `Summarize the most important market takeaway from this earnings report for an ES futures trader.
-
-Focus on implications for SPX, NQ, the relevant sector, and risk sentiment. Ignore minor details. Maximum two sentences.
-
-Use only the results provided. Any field marked N/A was not reported — say so plainly rather than guessing, and never state a revenue, EPS, guidance, or margin outcome that is not in the input.`;
-
-const takeawayCache = new Map<string, { text: string; at: number }>();
-
-function takeawayKey(r: EarningsResult): string {
-  return [r.ticker, r.revenue, r.eps, r.guidance, r.margins, r.stockReactionPct].join("|");
-}
-
-async function generateOne(result: EarningsResult): Promise<string | undefined> {
-  const anthropic = getClient();
-  if (!anthropic) return undefined;
-
-  const key = takeawayKey(result);
-  const hit = takeawayCache.get(key);
-  if (hit && Date.now() - hit.at < REFRESH.earnings) return hit.text;
-
-  try {
-    const response = await anthropic.beta.messages.create({
-      model: MODEL,
-      max_tokens: 4000,
-      betas: ["server-side-fallback-2026-07-01"],
-      fallbacks: "default",
-      system: TAKEAWAY_PROMPT,
-      output_config: {
-        effort: "low",
-        format: { type: "json_schema", schema: TAKEAWAY_SCHEMA },
-      },
-      messages: [
-        {
-          role: "user",
-          content: JSON.stringify({
-            ticker: result.ticker,
-            company: result.company,
-            sector: result.sector,
-            revenue: result.revenue,
-            eps: result.eps,
-            guidance: result.guidance,
-            margins: result.margins,
-            stockReactionPct: result.stockReactionPct,
-            fieldsNotReported: result.missingFields,
-          }),
-        },
-      ],
-    });
-
-    if (response.stop_reason === "refusal") return undefined;
-
-    const text = response.content.find((b) => b.type === "text");
-    if (!text || text.type !== "text") return undefined;
-
-    const { takeaway } = JSON.parse(text.text) as { takeaway: string };
-    takeawayCache.set(key, { text: takeaway.trim(), at: Date.now() });
-    return takeaway.trim();
-  } catch (error) {
-    console.error(`[ai] Takeaway for ${result.ticker} failed:`, error);
-    return undefined;
-  }
-}
-
-/** Attaches takeaways in parallel. A failure leaves that report's takeaway unset. */
-export async function attachEarningsTakeaways(
-  results: EarningsResult[],
-): Promise<EarningsResult[]> {
-  if (!aiEnabled()) return results;
-  return Promise.all(
-    results.map(async (r) => ({ ...r, takeaway: await generateOne(r) })),
-  );
 }

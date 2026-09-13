@@ -1,291 +1,270 @@
 /**
- * Every number that turns raw market data into a score or a label lives here.
+ * Every number that turns raw market data into a classification lives here.
+ *
+ * There are no composite scores and no weights. Each market is classified on
+ * three questions — where is it, which way is it moving, and how unusual is
+ * that move against its own history — and the cross-asset layer then compares
+ * the classifications instead of averaging them.
+ *
+ * "rank" thresholds are percentiles: a move "at rank 75" is larger than 75% of
+ * the same-length moves in that series' own recent history. Fixed "floor"
+ * values stop a very quiet regime from promoting tiny moves, and "fallback"
+ * values apply only when too little history is available to rank against.
  *
  * These are decision-support heuristics, not calibrated models. Edit freely —
- * /lib/scoring.ts reads this file and contains no magic numbers of its own.
+ * lib/engine reads this file and contains no magic numbers of its own.
  */
 
 import type { SectorKey } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
-// Helpers used by the anchor-point maps below
+// RATES / YIELD CURVE
 // ---------------------------------------------------------------------------
 
-/** [input, score] pairs, ascending by input. Interpolated linearly, clamped. */
-export type AnchorMap = Array<[number, number]>;
+export const RATES = {
+  /** 2s10s within ±this many bp is FLAT; below −this is INVERTED. */
+  flatBandBp: 20,
 
-// ---------------------------------------------------------------------------
-// MARKET STRESS — 0 = calm/supportive, 100 = severe financial stress
-// ---------------------------------------------------------------------------
-
-export const STRESS = {
   /**
-   * Composite weights. VIX, 10Y movement and credit dominate; the curve is
-   * deliberately minor because 2s10s says little about today's ES tape.
+   * A curve move counts only when the 2s10s change clears the floor AND is
+   * larger than `rank`% of historical moves over the same window. Anything
+   * smaller is labelled STABLE rather than forced into a category.
    */
-  weights: {
-    vix: 0.4,
-    rates: 0.3,
-    credit: 0.25,
-    curve: 0.05,
+  spread: {
+    rank: 60,
+    floorBp: { "1D": 3, "5D": 5 },
+    fallbackBp: { "1D": 4, "5D": 8 },
   },
 
-  vix: {
-    /** VIX level -> stress contribution. */
-    level: [
-      [10, 0],
-      [12, 8],
-      [15, 22],
-      [18, 35],
-      [20, 45],
-      [25, 60],
-      [30, 75],
-      [40, 90],
-      [55, 100],
-    ] as AnchorMap,
-    /** Daily % change -> stress; 50 is unchanged. */
-    changeCenter: 50,
-    changePerPct: 2.0,
-    /** Level vs change blend inside the VIX sub-score. */
-    levelWeight: 0.75,
+  /** A parallel shift: both legs move the same way while the slope holds. */
+  level: {
+    rank: 60,
+    floorBp: { "1D": 5, "5D": 10 },
+    fallbackBp: { "1D": 7, "5D": 14 },
   },
 
-  rates: {
+  /** A leading-leg move this unusual is a shock, not just a move. */
+  sharp: {
+    rank: 95,
+    floorBp: { "1D": 10, "5D": 20 },
+    fallbackBp: { "1D": 15, "5D": 30 },
+  },
+
+  /**
+   * 10Y driver: share of the nominal 10Y move explained by the real yield.
+   * The remainder is breakeven inflation (nominal = real + breakeven).
+   */
+  driver: {
+    realShareHigh: 0.65,
+    realShareLow: 0.35,
+  },
+
+  minHistory: 60,
+};
+
+// ---------------------------------------------------------------------------
+// CREDIT
+// ---------------------------------------------------------------------------
+
+export const CREDIT = {
+  /** HY OAS bands in bp — rough historical context, not trading rules. */
+  hyBands: [
+    { max: 300, label: "TIGHT" as const },
+    { max: 500, label: "NORMAL" as const },
+    { max: 700, label: "WARNING" as const },
+    { max: 1000, label: "SIGNIFICANT STRESS" as const },
+    { max: Infinity, label: "CRISIS" as const },
+  ],
+
+  /**
+   * Direction and speed come from the 5-day change ranked against that
+   * series' own 5-day changes. HY and IG each use their own history, so a
+   * 3bp IG move can matter as much as a 15bp HY move.
+   */
+  direction: {
+    widenRank: 75,
+    rapidRank: 95,
+    tightenRank: 75,
+    floorBp: { hy: 5, ig: 2 },
+    rapidFloorBp: { hy: 15, ig: 5 },
+    /** A single-day move this unusual is RAPID on its own. */
+    rapid1dRank: 99,
+    fallbackBp: {
+      hy: { widen: 10, rapid: 30 },
+      ig: { widen: 3, rapid: 8 },
+    },
+  },
+
+  /** Observations in the HY trend sparkline (~3 months). */
+  sparkDays: 65,
+
+  /** HYG/LQD proxy: 5-day relative move ranked against the last ~3 months. */
+  proxy: {
+    rank: 60,
+    floorPct: 0.15,
+    fallbackPct: 0.3,
+    sparkDays: 40,
+  },
+
+  minHistory: 60,
+};
+
+// ---------------------------------------------------------------------------
+// VOLATILITY
+// ---------------------------------------------------------------------------
+
+export const VOL = {
+  /** Descriptive VIX bands — level alone is never read as bullish. */
+  regimes: [
+    { max: 15, label: "VERY CALM" as const },
+    { max: 20, label: "NORMAL" as const },
+    { max: 30, label: "ELEVATED" as const },
+    { max: 50, label: "HIGH FEAR" as const },
+    { max: Infinity, label: "EXTREME" as const },
+  ],
+
+  /** Rate of change, in % moves of the VIX, ranked against the last year. */
+  momentum: {
+    spikeRank: 95,
+    riseRank: 70,
+    fallRank: 70,
+    spikeFloorPct: { "1D": 15, "5D": 25 },
+    riseFloorPct: { "1D": 5, "5D": 8 },
+    fallback: {
+      spikePct: { "1D": 20, "5D": 30 },
+      risePct: { "1D": 8, "5D": 12 },
+    },
+    /** A slow 5-day drift up this large gets called out even when "stable". */
+    driftPct: 5,
+  },
+
+  /**
+   * Term structure slope = longer / shorter − 1. Within ±flatPct is FLAT.
+   * Futures (M2 vs M1) sit closer together than VIX3M vs spot, so the proxy
+   * gets a wider flat band.
+   */
+  term: {
+    futuresFlatPct: 2,
+    proxyFlatPct: 5,
+  },
+
+  /** Very low VIX gets a complacency note: calm now says nothing about later. */
+  complacency: { level: 13, levelPct1y: 10 },
+
+  minHistory: 60,
+};
+
+// ---------------------------------------------------------------------------
+// EQUITY CONFIRMATION
+// ---------------------------------------------------------------------------
+
+export const EQUITY = {
+  /** |ES change| below this is treated as no directional signal. */
+  flatPct: 0.2,
+
+  participation: {
+    /** RTY lags when it trails ES by max(minPct, fraction × |ES|). */
+    rtyLagMinPct: 0.3,
+    rtyLagFraction: 0.4,
+    /** RSP trailing SPY by this much is a material equal-weight lag. */
+    rspLagPct: 0.25,
+    /** NQ moving against ES by at least this much makes the tape MIXED. */
+    nqOppositePct: 0.2,
+  },
+
+  /**
+   * Breadth checks, stated for an up-move; they mirror for a down-move.
+   * Each indicator either confirms, contradicts, or says nothing.
+   */
+  breadth: {
+    ad: { confirm: 1.5, contradict: 1.0 },
+    vwap: { confirm: 55, contradict: 50 },
+    /** RSP minus SPY: equal weight must actually keep up to count as confirming. */
+    rsp: { confirm: 0.05, contradict: -0.25 },
+  },
+
+  rotation: {
     /**
-     * The daily bp move matters far more than the absolute level for ES.
-     * Rising yields = stress, falling yields = relief.
+     * The GICS business-model split. Three sectors are shown but kept out of
+     * the spread: semis (a subset of XLK — counting both double-counts tech),
+     * energy (it often rallies as a hedge in inflation and geopolitical
+     * shocks) and real estate (hybrid, and driven mostly by rates).
      */
-    changeCenter: 50,
-    changePerBp: 4.0,
-    /** Absolute 10Y level -> background stress, low weight. */
-    level: [
-      [2.0, 0],
-      [3.0, 15],
-      [4.0, 40],
-      [4.5, 60],
-      [5.0, 80],
-      [6.0, 100],
-    ] as AnchorMap,
-    changeWeight: 0.75,
-  },
-
-  credit: {
-    /** HY OAS in bp -> stress contribution. */
-    level: [
-      [250, 10],
-      [300, 20],
-      [350, 35],
-      [400, 50],
-      [500, 70],
-      [700, 90],
-      [1000, 100],
-    ] as AnchorMap,
-    /** Widening = stress, tightening = relief. */
-    changeCenter: 50,
-    changePerBp: 3.0,
-    levelWeight: 0.7,
-  },
-
-  curve: {
-    /** 2s10s in bp (10Y minus 2Y) -> stress. Inversion reads as stress. */
-    level: [
-      [-150, 100],
-      [-100, 90],
-      [-50, 72],
-      [0, 50],
-      [50, 34],
-      [100, 20],
-      [200, 10],
-    ] as AnchorMap,
-  },
-
-  /** Upper bound of each class, ascending. */
-  classes: [
-    { max: 32, label: "LOW" as const },
-    { max: 50, label: "NORMAL" as const },
-    { max: 70, label: "ELEVATED" as const },
-    { max: 101, label: "HIGH" as const },
-  ],
-
-  conclusions: {
-    LOW: "Conditions supportive.",
-    NORMAL: "Conditions broadly neutral.",
-    ELEVATED: "Financial conditions are tightening against equities.",
-    HIGH: "Financial conditions are actively restrictive.",
+    cyclical: ["tech", "communication", "discretionary", "financials", "industrials", "materials"] as SectorKey[],
+    defensive: ["utilities", "staples", "healthcare"] as SectorKey[],
+    /**
+     * STRONG rotation must be broad: at least this share of cyclical sectors
+     * beating SPY. A spread carried by one or two sectors is capped at MILD.
+     */
+    broadShare: 0.6,
+    /** Today's cyclical-minus-defensive spread, ranked against recent days. */
+    strongRank: 85,
+    mildRank: 50,
+    strongFloorPct: 0.5,
+    mildFloorPct: 0.15,
+    fallbackPct: { strong: 1.0, mild: 0.3 },
+    shown: 3,
+    minHistory: 30,
   },
 };
 
 // ---------------------------------------------------------------------------
-// BREADTH — 0 = no participation, 100 = universal participation
+// CROSS-ASSET DIVERGENCE
 // ---------------------------------------------------------------------------
 
-export const BREADTH = {
-  weights: {
-    vwap: 0.4,
-    advanceDecline: 0.35,
-    equalWeight: 0.25,
-  },
-
-  /** % above VWAP maps 1:1 onto the sub-score. */
-  vwapPassThrough: true,
-
-  advanceDecline: {
-    /** score = center + perLog2 * log2(ratio); 1:1 => 50. */
-    center: 50,
-    perLog2: 25,
-  },
-
-  equalWeight: {
-    /** RSP-minus-SPY in percentage points -> sub-score. 0 => 50. */
-    center: 50,
-    perPct: 80,
-    /** |RSP-SPY| above this counts as a genuine broadening/narrowing signal. */
-    significantPct: 0.1,
-  },
-
-  classes: [
-    { max: 20, label: "VERY WEAK" as const },
-    { max: 40, label: "WEAK" as const },
-    { max: 60, label: "NEUTRAL" as const },
-    { max: 80, label: "STRONG" as const },
-    { max: 101, label: "VERY STRONG" as const },
-  ],
-
-  conclusions: {
-    "VERY WEAK": "Participation is very narrow; index moves lack support.",
-    WEAK: "Participation is thin relative to the index move.",
-    NEUTRAL: "Participation is mixed.",
-    STRONG: "Broad participation confirms ES.",
-    "VERY STRONG": "Exceptionally broad participation behind ES.",
-  },
+export const CROSS = {
+  /** ES session move that counts as "rising" / "falling" for divergences. */
+  esUpPct: 0.3,
+  esDownPct: 0.4,
+  /** Or a 5-day advance this large, since credit is read on a 5-day window. */
+  es5dUpPct: 0.75,
+  maxDivergencesShown: 3,
 };
 
 // ---------------------------------------------------------------------------
-// SECTOR ROTATION — 0 = fully defensive, 100 = fully risk-on
-// ---------------------------------------------------------------------------
-
-export const ROTATION = {
-  /**
-   * Semis are split out from broad tech on purpose: they are the cleanest
-   * single read on NQ and on high-beta risk appetite generally.
-   */
-  cyclical: {
-    semis: 0.28,
-    tech: 0.22,
-    financials: 0.18,
-    industrials: 0.16,
-    discretionary: 0.16,
-  } as Partial<Record<SectorKey, number>>,
-
-  defensive: {
-    utilities: 0.35,
-    staples: 0.35,
-    healthcare: 0.3,
-  } as Partial<Record<SectorKey, number>>,
-
-  /** score = center + perPct * (cyclicalAvg% - defensiveAvg%) */
-  center: 50,
-  perPct: 19,
-
-  classes: [
-    { max: 30, label: "DEFENSIVE" as const },
-    { max: 45, label: "SLIGHTLY DEFENSIVE" as const },
-    { max: 55, label: "NEUTRAL" as const },
-    { max: 70, label: "RISK-ON" as const },
-    { max: 101, label: "STRONG RISK-ON" as const },
-  ],
-
-  /** How many names to show in each column. */
-  leadersShown: 4,
-  laggardsShown: 3,
-
-  /** |change| in % that promotes a single arrow to a double arrow. */
-  strongMovePct: 1.0,
-
-  conclusions: {
-    DEFENSIVE: "Capital is rotating into defensives.",
-    "SLIGHTLY DEFENSIVE": "Mild defensive tilt in leadership.",
-    NEUTRAL: "No clear rotational bias.",
-    "RISK-ON": "Cyclical leadership is intact.",
-    "STRONG RISK-ON": "Aggressive rotation into cyclicals and high beta.",
-  },
-};
-
-// ---------------------------------------------------------------------------
-// INDEX CONFIRMATION — how well NQ and RTY corroborate ES
-// ---------------------------------------------------------------------------
-
-export const CONFIRMATION = {
-  /** |change%| below this is treated as flat/no signal. */
-  flatPct: 0.1,
-  /** |change%| at or above this earns a double arrow. */
-  strongPct: 0.5,
-
-  /** Nominal 0-100 strength used when blending into Today's Read. */
-  scoreByClass: {
-    STRONG: 85,
-    MODERATE: 60,
-    WEAK: 35,
-    DIVERGENT: 20,
-  },
-};
-
-// ---------------------------------------------------------------------------
-// EVENT RISK — importance weighted, with a concentration bonus
+// EVENT RISK — describes catalyst risk, never current market stress
 // ---------------------------------------------------------------------------
 
 export const EVENT_RISK = {
   points: { HIGH: 3, MED: 1.5, LOW: 0.5 },
   /** Extra points when 2+ HIGH events land on the same session. */
   multipleHighBonus: 1.5,
-  /** Events landing inside this window compound each other. */
+  /** High-impact events landing inside this window compound each other. */
   clusterWindowMinutes: 120,
   clusterBonus: 1.0,
-
   thresholds: { high: 6, medium: 3 },
-
-  /** Low-impact events are hidden unless flagged; keeps the card scannable. */
+  /** Low-impact events are hidden; keeps the card scannable. */
   hideLowImpact: true,
+  /** How far ahead to look for the next major catalyst. */
+  lookaheadDays: 14,
+  /** High-impact releases after the session shown under "Later". */
+  laterShown: 4,
 };
 
 // ---------------------------------------------------------------------------
-// TODAY'S READ — regime + confidence synthesis
-// ---------------------------------------------------------------------------
-
-export const READ = {
-  /** Weights over the four pillar scores (all in risk-on polarity, 0-100). */
-  weights: {
-    breadth: 0.3,
-    rotation: 0.3,
-    stress: 0.25,
-    confirmation: 0.15,
-  },
-
-  regime: [
-    { max: 42, label: "RISK-OFF" as const },
-    { max: 58, label: "NEUTRAL" as const },
-    { max: 101, label: "RISK-ON" as const },
-  ],
-
-  confidence: {
-    /** confidence = base + |composite-50| * conviction - stdev * dispersion */
-    base: 50,
-    convictionMultiplier: 1.4,
-    dispersionPenalty: 0.8,
-    min: 25,
-    max: 95,
-  },
-};
-
-// ---------------------------------------------------------------------------
-// EARNINGS — what counts as index-relevant
+// EARNINGS — only reports large enough to move the index
 // ---------------------------------------------------------------------------
 
 export const EARNINGS_CFG = {
-  /** Reporters smaller than this are dropped unless importance is HIGH. */
-  minMarketCapUsd: 50e9,
-  maxShownPerSlot: 4,
+  /** Reporters below this market cap are not index-moving and are not shown. */
+  marketMovingCapUsd: 200e9,
+  maxShown: 4,
   maxReportedShown: 3,
+};
+
+// ---------------------------------------------------------------------------
+// MARKET SESSION (NYSE cash hours; ES trades Globex around them)
+// ---------------------------------------------------------------------------
+
+export const SESSION = {
+  rthOpenMinutes: 9 * 60 + 30,
+  rthCloseMinutes: 16 * 60,
+  earlyCloseMinutes: 13 * 60,
+  /** Globex daily halt 17:00-18:00 ET. */
+  globexHaltMinutes: 17 * 60,
+  globexOpenMinutes: 18 * 60,
+  /** Unscheduled NYSE closures (e.g. national days of mourning), YYYY-MM-DD. */
+  extraClosures: [] as string[],
 };
 
 // ---------------------------------------------------------------------------
@@ -295,27 +274,28 @@ export const EARNINGS_CFG = {
 export const REFRESH = {
   futures: 30_000,
   volatility: 60_000,
+  vixFutures: 120_000,
   breadth: 120_000,
   sectors: 300_000,
-  rates: 120_000,
+  rates: 300_000,
   credit: 900_000,
+  creditProxy: 120_000,
   calendar: 300_000,
   earnings: 600_000,
-  /**
-   * How often the page checks for a newer published snapshot. Snapshots
-   * publish every ~5 minutes and static files cost nothing to poll.
-   */
+  /** How often the page checks for a newer published snapshot. */
   dashboard: 60_000,
-  /** Today's Read is regenerated no more often than this. */
-  aiRead: 300_000,
+  /**
+   * An AI-written Today's Read is reused while every classification it was
+   * written from is unchanged, up to this age.
+   */
+  aiRead: 60 * 60_000,
 };
 
 /**
- * Age (ms) past which a block is downgraded LIVE -> DELAYED -> STALE.
- *
- * Calibrated for the published-snapshot model: the refresh runs every 5
- * minutes on weekdays and GitHub's scheduler can start it several minutes
- * late, so anything under 15 minutes old is on schedule.
+ * Pipeline age (ms) past which a block is downgraded LIVE -> DELAYED -> STALE.
+ * Calibrated for the ~5 minute published-snapshot cadence. This is about the
+ * refresh pipeline, not market hours — a daily series is labelled with its
+ * own observation date separately.
  */
 export const FRESHNESS = {
   delayedAfterMs: 15 * 60_000,

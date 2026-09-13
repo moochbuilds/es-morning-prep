@@ -1,182 +1,112 @@
-import type { DashboardData, Regime, RiskLevel, TodayRead as Read, Tone } from "@/lib/types";
+"use client";
+
+import type { Analysis, CatalystView, Interpretation, Tone } from "@/lib/types";
 import { etTime } from "@/lib/format";
-import { confirmationTone } from "@/lib/scoring";
+import { dayShort } from "@/lib/engine/session";
 
 import { Card } from "./ui/Card";
-import { ScoreBar } from "./ui/ScoreBar";
+import { Info, Why } from "./ui/Popover";
+import { ALIGNMENT_TONE, RISK_TONE, SEVERITY_TONE, TONE_BORDER, TONE_DOT, TONE_TEXT } from "./ui/tone";
 
-const REGIME_STYLE: Record<Regime, string> = {
-  "RISK-ON": "text-pos",
-  NEUTRAL: "text-ink",
-  "RISK-OFF": "text-neg",
-};
-
-const RISK_STYLE: Record<RiskLevel, string> = {
-  LOW: "text-pos",
-  MEDIUM: "text-warn",
-  HIGH: "text-neg",
-};
-
-/** Colours a pillar reading by what it means for equities, not alphabetically. */
-function pillarTone(value: string): Tone {
-  const v = value.toUpperCase();
-  if (/VERY STRONG|STRONG RISK-ON|^STRONG$|RISK-ON|^LOW$/.test(v)) return "supportive";
-  if (/VERY WEAK|^WEAK$|DEFENSIVE|DIVERGENT|ELEVATED|^HIGH$/.test(v)) return "restrictive";
-  return "neutral";
-}
-
-const TONE_TEXT: Record<Tone, string> = {
-  supportive: "text-pos",
-  neutral: "text-ink-2",
-  restrictive: "text-neg",
-};
-
-function Pillar({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: string;
-  /** Overrides the label-based colour when meaning depends on direction. */
-  tone?: Tone;
-}) {
+function Driver({ label, text, tone }: { label: string; text: string; tone: Tone }) {
   return (
-    <div className="flex items-baseline justify-between gap-3 border-b border-line-soft py-2 last:border-b-0">
+    <div className="grid grid-cols-1 gap-x-4 gap-y-0.5 border-b border-line-soft py-2.5 last:border-b-0 sm:grid-cols-[8.5rem_1fr]">
       <span className="text-xs text-ink-3">{label}</span>
-      <span className={`text-xs font-semibold ${TONE_TEXT[tone ?? pillarTone(value)]}`}>
-        {value}
+      <span className="flex items-baseline gap-2 text-sm text-ink">
+        <span className={`h-2 w-2 shrink-0 translate-y-[-1px] rounded-full ${TONE_DOT[tone]}`} />
+        {text}
       </span>
     </div>
   );
 }
 
 export function TodayRead({
-  data,
-  read,
-  now,
+  analysis,
+  narrative,
+  catalysts,
 }: {
-  data: DashboardData;
-  read: Read | null;
-  now: number;
+  analysis: Analysis;
+  narrative: Pick<Interpretation, "text" | "generatedBy" | "generatedAt">;
+  catalysts: CatalystView;
 }) {
-  const eventRisk = data.derived.eventRisk.level;
+  const s = analysis.synthesis;
+  const risk = catalysts.eventRisk.level;
+  const riskDay = catalysts.sessionIsToday ? "Today" : dayShort(catalysts.sessionDate);
+  const topDivergence = s.divergences[0];
+  const alignmentEvidence = { ...s.alignment.evidence, lines: [s.alignment.text, ...s.alignment.evidence.lines] };
 
   return (
-    <Card
-      title="Today's Read"
-      tooltip="Synthesis of breadth, rotation, stress and index confirmation into a single market regime."
-      now={now}
-      emphasis
-    >
-      {!read ? (
-        <ReadSkeleton />
-      ) : (
-        <div className="flex flex-1 flex-col">
-          {/* Headline row */}
-          <div className="grid grid-cols-3 gap-4">
-            <div>
-              <span className="eyebrow">Regime</span>
-              <p
-                className={`mt-1 text-2xl font-semibold tracking-tight ${REGIME_STYLE[read.regime]}`}
-              >
-                {read.regime}
-              </p>
-            </div>
-            <div>
-              <span className="eyebrow">Confidence</span>
-              <p className="readout mt-1 text-2xl font-semibold text-ink">
-                {read.confidence}%
-              </p>
-            </div>
-            <div>
-              <span className="eyebrow">Event Risk</span>
-              <p
-                className={`mt-1 text-2xl font-semibold tracking-tight ${RISK_STYLE[eventRisk]}`}
-              >
-                {eventRisk}
-              </p>
-            </div>
-          </div>
-
-          {/* Confidence uses the same bar language as the other 0-100 scores;
-              the number itself is already in the headline row above. */}
-          <div className="mt-3.5">
-            <ScoreBar
-              value={read.confidence}
-              classification=""
-              showValue={false}
-              tone={
-                read.regime === "RISK-ON"
-                  ? "supportive"
-                  : read.regime === "RISK-OFF"
-                    ? "restrictive"
-                    : "neutral"
-              }
-            />
-          </div>
-
-          {/* Pillars */}
-          <div className="divider mt-4 pt-1">
-            <Pillar label="Breadth" value={read.breadth} />
-            <Pillar label="Rotation" value={read.rotation} />
-            <Pillar label="Stress" value={read.stress} />
-            <Pillar
-              label="Confirmation"
-              value={read.confirmation}
-              tone={
-                data.derived.confirmation
-                  ? confirmationTone(data.derived.confirmation)
-                  : undefined
-              }
-            />
-          </div>
-
-          {/* Interpretation */}
-          <p className="mt-4 text-sm leading-relaxed text-ink-2">
-            {read.summary}
+    <Card title="Today's Read" emphasis>
+      {/* The three readings the eye should hit first */}
+      <div className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
+        <div className="col-span-2 min-w-0 sm:col-span-1">
+          <span className="eyebrow">Market backdrop</span>
+          <p className={`mt-1 text-2xl font-semibold leading-tight tracking-tight ${TONE_TEXT[s.backdrop.tone]}`}>
+            {s.backdrop.label}
           </p>
-
-          <div className="mt-auto pt-4">
-            <div className="rounded-md border border-line bg-base/40 px-3.5 py-3">
-              <span className="eyebrow text-warn/80">Main Risk</span>
-              <p className="mt-1 text-xs leading-relaxed text-ink-2">
-                {read.mainRisk}
-              </p>
-            </div>
-            <p className="mt-2.5 text-2xs text-ink-3">
-              {read.generatedBy === "ai" ? "AI interpretation" : "Rule-based"} ·{" "}
-              {etTime(read.generatedAt)} ET
-            </p>
-          </div>
         </div>
-      )}
-    </Card>
-  );
-}
+        <div>
+          <span className="eyebrow flex items-center gap-1.5">
+            Alignment <Info term="alignment" align="right" />
+          </span>
+          <p className={`mt-1 text-2xl font-semibold leading-tight ${TONE_TEXT[ALIGNMENT_TONE[s.alignment.state]]}`}>
+            <Why evidence={alignmentEvidence} align="right">
+              {s.alignment.state}
+            </Why>
+          </p>
+        </div>
+        <div>
+          <span className="eyebrow flex items-center gap-1.5">
+            Event risk · {riskDay} <Info term="eventRisk" align="right" />
+          </span>
+          <p className={`mt-1 text-2xl font-semibold leading-tight ${TONE_TEXT[RISK_TONE[risk]]}`}>{risk}</p>
+        </div>
+      </div>
 
-/** Shown for the moment between first paint and the AI response landing. */
-function ReadSkeleton() {
-  return (
-    <div className="flex flex-1 animate-pulse flex-col gap-4" aria-busy="true">
-      <div className="grid grid-cols-3 gap-4">
-        {[0, 1, 2].map((i) => (
-          <div key={i}>
-            <div className="h-2 w-16 rounded bg-line" />
-            <div className="mt-2 h-6 w-24 rounded bg-line" />
-          </div>
-        ))}
+      {/* What it means for the ES environment */}
+      <div className={`mt-4 rounded-md border border-l-2 border-line bg-base/40 px-4 py-3 ${TONE_BORDER[s.backdrop.tone]}`}>
+        <span className="eyebrow">ES context</span>
+        <p className="mt-1 text-sm leading-relaxed text-ink">{s.esContext}</p>
       </div>
-      <div className="h-1.5 rounded-full bg-line" />
-      <div className="space-y-2.5 pt-2">
-        {[0, 1, 2, 3].map((i) => (
-          <div key={i} className="h-3 rounded bg-line-soft" />
-        ))}
+
+      <div className="mt-2">
+        <Driver label="Main tailwind" text={s.tailwind ?? "None clear"} tone={s.tailwind ? "constructive" : "neutral"} />
+        <Driver
+          label="Main headwind"
+          text={s.headwind ?? "None significant"}
+          tone={s.headwind ? (s.backdrop.tone === "stressed" ? "stressed" : "caution") : "neutral"}
+        />
+        <Driver
+          label="Main divergence"
+          text={s.divergence ?? "None significant"}
+          tone={topDivergence ? SEVERITY_TONE[topDivergence.severity] : "neutral"}
+        />
       </div>
-      <div className="mt-3 space-y-2">
-        <div className="h-3 rounded bg-line-soft" />
-        <div className="h-3 w-4/5 rounded bg-line-soft" />
+
+      <p className="divider mt-2 pt-3 text-sm leading-relaxed text-ink-2">{narrative.text}</p>
+
+      <div className="divider mt-4 pt-3">
+        <span className="eyebrow">What changed · since the prior session</span>
+        <ul className="mt-1">
+          {s.whatChanged.map((w) => (
+            <li
+              key={w.market}
+              className="grid grid-cols-[5.5rem_1fr] items-baseline gap-3 border-b border-line-soft py-2 last:border-b-0"
+            >
+              <span className="text-xs text-ink-3">{w.market}</span>
+              <span className="text-sm">
+                <span className="readout text-ink">{w.fact}</span>
+                <span className={TONE_TEXT[w.tone]}> → {w.implication}</span>
+              </span>
+            </li>
+          ))}
+        </ul>
       </div>
-    </div>
+
+      <p className="mt-auto pt-4 text-2xs text-ink-3">
+        {narrative.generatedBy === "ai" ? "AI explanation of the engine's classifications" : "Rule-based explanation"} ·{" "}
+        {etTime(narrative.generatedAt)} ET · context, not a trade signal
+      </p>
+    </Card>
   );
 }
