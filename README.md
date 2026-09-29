@@ -272,7 +272,7 @@ Pages. Visitors download static files and never trigger a fetch.
 
 | | |
 |---|---|
-| Refresh cadence | About every 2 min while futures trade (Sun 6pm – Fri 5pm ET); every 30 min on weekends |
+| Refresh cadence | ~2 min weekdays 7am–5pm ET; ~10 min overnight while futures trade; hourly while they're closed (Fri 5pm – Sun 6pm ET) |
 | On demand | **Refresh** in the header starts a run, once live refresh is enabled (below) |
 | Cost | Free: Actions minutes are free for public repos, and Pages is free static hosting |
 | Page load | Served from GitHub's CDN, with the latest snapshot embedded in the HTML |
@@ -289,8 +289,10 @@ Resilience:
   countdown are recomputed against the viewer's clock.
 - **Self-chaining runs.** GitHub's cron is best effort and in September 2026
   fell to a handful of runs a day, so each run queues the next one itself
-  (the `next` job) about 2 minutes after the last one started, backing off to
-  10 minutes after a failure. The cron only restarts the chain if it breaks.
+  (the `next` job) at the cadence above, backing off to 10 minutes after a
+  failure. While it waits it steps aside for any queued run, so a Refresh
+  click isn't held up. The cron (every 15 min while futures trade) only
+  restarts the chain if it breaks.
   Duplicate chains collapse, because GitHub keeps one pending run per
   concurrency group. To pause refreshing, cancel a run or disable the
   workflow.

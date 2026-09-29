@@ -245,7 +245,7 @@ export function Dashboard({
 
       <footer className="mt-8 flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-line-soft pt-4 text-2xs text-ink-3">
         <span>All times Eastern.</span>
-        <span>Data refreshes about every 2 minutes while futures trade.</span>
+        <span>Data refreshes every ~2 min 7am–5pm on weekdays, ~10 min overnight, hourly while futures are closed.</span>
         <span>
           Classifications are deterministic heuristics judged against each series&apos; own history — context,
           not trade signals.
