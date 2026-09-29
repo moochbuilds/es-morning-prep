@@ -3,7 +3,11 @@ name: Refresh data and deploy
 on:
   push:
     branches: [main]
+  # Started by the previous run (the `next` job below) and by the page's
+  # Refresh button.
   workflow_dispatch:
+  # Only a restart for the chain. GitHub's scheduler is best effort and drops
+  # most of these under load (down to ~6 runs a day in Sep 2026).
   schedule:
     # Cron is UTC. US index futures trade Sun 6pm ET to Fri 5pm ET.
     # Minutes are offset from :00 because GitHub's scheduler is most congested
@@ -18,11 +22,14 @@ on:
     - cron: "17,47 * * * 6"
 
 permissions:
+  actions: write # the next run in the chain
   contents: write # keepalive heartbeat commit
   pages: write
   id-token: write
 
 # One deploy at a time. A tick that arrives mid-run waits rather than racing.
+# GitHub keeps at most one pending run per group and cancels the older one, so
+# duplicate chains (a cron tick, a push, a Refresh click) collapse into one.
 concurrency:
   group: pages
   cancel-in-progress: false
@@ -31,7 +38,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      started: ${{ steps.start.outputs.at }}
     steps:
+      - id: start
+        run: echo "at=$(date +%s)" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -61,6 +73,8 @@ jobs:
         run: npm run build
         env:
           NEXT_PUBLIC_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+          # Lets the page's Refresh button start this workflow.
+          NEXT_PUBLIC_GITHUB_REPOSITORY: ${{ github.repository }}
 
       - uses: actions/upload-pages-artifact@v3
         with:
@@ -75,6 +89,46 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+
+  # Each run starts the next one: GitHub's cron can't be relied on for the
+  # cadence. Events started with GITHUB_TOKEN don't trigger workflows, except
+  # workflow_dispatch, which is what this uses. The dispatched run waits in the
+  # concurrency group until this one finishes. Cancel a run to stop the chain;
+  # the next landed cron tick restarts it.
+  next:
+    needs: [build, deploy]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Queue the next refresh while futures trade
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STARTED: ${{ needs.build.outputs.started }}
+          FAILED: ${{ needs.build.result != 'success' || needs.deploy.result != 'success' }}
+        run: |
+          # Sunday 22:00 UTC (6pm EDT) to Friday 22:00 UTC (5pm EST). The
+          # weekend crons cover the rest.
+          dow=$(date -u +%u) hour=$(date -u +%-H)
+          if [ "$dow" -eq 6 ] || { [ "$dow" -eq 7 ] && [ "$hour" -lt 22 ]; } \
+             || { [ "$dow" -eq 5 ] && [ "$hour" -ge 22 ]; }; then
+            echo "Futures closed; not chaining."
+            exit 0
+          fi
+
+          # About one refresh every 2 minutes; back off after a failure so a
+          # broken provider doesn't turn into a run every minute.
+          spacing=120
+          if [ "$FAILED" = "true" ]; then spacing=600; fi
+          delay=$(( ${STARTED:-0} + spacing - $(date +%s) ))
+          if [ "$delay" -gt "$spacing" ]; then delay=$spacing; fi
+          if [ "$delay" -gt 0 ]; then sleep "$delay"; fi
+
+          for attempt in 1 2 3; do
+            gh workflow run deploy.yml --ref main -R "$GITHUB_REPOSITORY" && exit 0
+            sleep $(( attempt * 15 ))
+          done
+          exit 1
 
   # GitHub disables scheduled workflows in public repos after 60 days without
   # commits. Pages deploys are artifacts, not commits, so without this the

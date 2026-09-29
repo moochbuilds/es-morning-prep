@@ -266,13 +266,14 @@ call. Without a key, the deterministic writer runs and no request is made.
 
 ## Hosting: GitHub Pages, free with no metering
 
-The site is a static export. A scheduled GitHub Action runs the tests, fetches
-every source once, writes `public/data/*.json`, builds the site and publishes
-it to Pages. Visitors download static files and never trigger a fetch.
+The site is a static export. A GitHub Action runs the tests, fetches every
+source once, writes `public/data/*.json`, builds the site and publishes it to
+Pages. Visitors download static files and never trigger a fetch.
 
 | | |
 |---|---|
-| Refresh cadence | Every 5 min on weekdays; every 30 min on weekends |
+| Refresh cadence | About every 2 min while futures trade (Sun 6pm – Fri 5pm ET); every 30 min on weekends |
+| On demand | **Refresh** in the header starts a run, once live refresh is enabled (below) |
 | Cost | Free: Actions minutes are free for public repos, and Pages is free static hosting |
 | Page load | Served from GitHub's CDN, with the latest snapshot embedded in the HTML |
 | Polling | The page checks for a newer snapshot every 60s (static file, no cost) |
@@ -286,12 +287,28 @@ Resilience:
   the live site is left untouched.
 - **Client-side ageing.** Freshness, session state and the next-catalyst
   countdown are recomputed against the viewer's clock.
+- **Self-chaining runs.** GitHub's cron is best effort and in September 2026
+  fell to a handful of runs a day, so each run queues the next one itself
+  (the `next` job) about 2 minutes after the last one started, backing off to
+  10 minutes after a failure. The cron only restarts the chain if it breaks.
+  Duplicate chains collapse, because GitHub keeps one pending run per
+  concurrency group. To pause refreshing, cancel a run or disable the
+  workflow.
 - **Keepalive.** A weekly check commits a heartbeat if the repo has been quiet
   for 45 days, so GitHub doesn't disable the schedule.
 
 One-time setup: push as a public repo; **Settings → Pages → Source: GitHub
 Actions**; add `FRED_API_KEY` (and optionally `ANTHROPIC_API_KEY`) under
 **Settings → Secrets and variables → Actions**.
+
+**Live refresh (optional, per browser).** Create a fine-grained token (GitHub →
+Settings → Developer settings → Fine-grained tokens) with access to this repo
+only and **Actions: Read and write**, then click **Enable live refresh** next
+to Refresh and paste it. Refresh then starts a run and the page picks up the
+new snapshot in about 2 minutes. The token is kept in that browser's
+localStorage and sent only to api.github.com. Anything else you host under the
+same `<user>.github.io` origin could read it, which is why it should carry no
+other permissions.
 
 ### Caveats
 

@@ -6,6 +6,7 @@ import { FRESHNESS, REFRESH } from "@/config/thresholds";
 import { buildCatalystView } from "@/lib/engine/catalysts";
 import { ago } from "@/lib/format";
 import { ageBlock } from "@/lib/freshness";
+import { REPO, TriggerError, dispatchRefresh, readToken, saveToken } from "@/lib/trigger";
 import { SCHEMA_VERSION, type DashboardData, type Interpretation } from "@/lib/types";
 
 import { CatalystCard } from "./CatalystCard";
@@ -20,6 +21,10 @@ import { VolatilityCard } from "./VolatilityCard";
 
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const CLOCK_TICK_MS = 15_000;
+/** While a requested refresh is running, check for its snapshot this often. */
+const PENDING_POLL_MS = 10_000;
+/** A requested run normally publishes in ~2 minutes; give up waiting after this. */
+const PENDING_TIMEOUT_MS = 8 * 60_000;
 
 class NewerVersionError extends Error {}
 
@@ -106,6 +111,57 @@ export function Dashboard({
     };
   }, [initialData, load]);
 
+  // Whether Refresh can start a run, rather than only reload the snapshot.
+  // Read after mount: the prerendered HTML has no localStorage.
+  const [canTrigger, setCanTrigger] = useState(false);
+  useEffect(() => setCanTrigger(Boolean(REPO && readToken())), []);
+
+  /** Set while a requested run is publishing: when it was requested, and the snapshot it must beat. */
+  const [pending, setPending] = useState<{ at: number; after: string } | null>(null);
+
+  const refresh = useCallback(async () => {
+    const token = REPO ? readToken() : null;
+    if (!token) return load();
+    setRefreshing(true);
+    try {
+      await dispatchRefresh(token);
+      setPending({ at: Date.now(), after: data?.generatedAt ?? "" });
+      setError(null);
+    } catch (err) {
+      console.error("Refresh request failed:", err);
+      setError(err instanceof TriggerError ? err.message : "Couldn't start a refresh.");
+    }
+    await load();
+  }, [data, load]);
+
+  useEffect(() => {
+    if (!pending) return;
+    if (data && data.generatedAt > pending.after) return setPending(null);
+    if (Date.now() - pending.at > PENDING_TIMEOUT_MS) {
+      setPending(null);
+      setError("A refresh was requested but no new snapshot has been published yet. Check the repo's Actions tab.");
+      return;
+    }
+    const poll = setTimeout(() => void load(), PENDING_POLL_MS);
+    return () => clearTimeout(poll);
+  }, [pending, data, now, load]);
+
+  const connect = useCallback(() => {
+    if (readToken()) {
+      if (!window.confirm("Stop starting data refreshes from this browser? The saved GitHub token is removed.")) return;
+      saveToken(null);
+      setCanTrigger(false);
+      return;
+    }
+    const token = window.prompt(
+      "Paste a fine-grained GitHub token for this repo with Actions: Read and write. " +
+        "It is saved only in this browser, and Refresh will then fetch fresh data.",
+    );
+    if (!token?.trim()) return;
+    saveToken(token.trim());
+    setCanTrigger(Boolean(readToken()));
+  }, []);
+
   const view = useMemo(() => (data ? project(data, now || Date.parse(data.generatedAt)) : null), [data, now]);
 
   if (!view) return <WaitingForSnapshot error={error} />;
@@ -127,8 +183,9 @@ export function Dashboard({
         data={view}
         catalysts={catalysts}
         now={clock}
-        onRefresh={() => void load()}
-        refreshing={refreshing}
+        onRefresh={() => void refresh()}
+        refreshing={refreshing || pending !== null}
+        trigger={REPO ? { connected: canTrigger, onConnect: connect } : null}
       />
 
       {snapshotAge >= FRESHNESS.staleAfterMs && (
@@ -188,7 +245,7 @@ export function Dashboard({
 
       <footer className="mt-8 flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-line-soft pt-4 text-2xs text-ink-3">
         <span>All times Eastern.</span>
-        <span>Data refreshes about every 5 minutes on weekdays.</span>
+        <span>Data refreshes about every 2 minutes while futures trade.</span>
         <span>
           Classifications are deterministic heuristics judged against each series&apos; own history — context,
           not trade signals.

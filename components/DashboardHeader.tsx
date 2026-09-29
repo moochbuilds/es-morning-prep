@@ -26,12 +26,15 @@ export function DashboardHeader({
   now,
   onRefresh,
   refreshing,
+  trigger,
 }: {
   data: DashboardData;
   catalysts: CatalystView;
   now: number;
   onRefresh: () => void;
   refreshing: boolean;
+  /** Null where Refresh can only reload (no repo configured, e.g. local dev). */
+  trigger: { connected: boolean; onConnect: () => void } | null;
 }) {
   const session = catalysts.session;
   const futures = data.futures.data;
@@ -79,11 +82,29 @@ export function DashboardHeader({
             type="button"
             onClick={onRefresh}
             disabled={refreshing}
-            title="Load the latest published snapshot"
+            title={
+              trigger?.connected
+                ? "Fetch fresh data now (publishes in about 2 minutes)"
+                : "Load the latest published snapshot"
+            }
             className="rounded border border-line px-2 py-0.5 text-2xs text-ink-2 transition-colors hover:border-ink-3 hover:text-ink disabled:opacity-40"
           >
             {refreshing ? "Refreshing…" : "Refresh"}
           </button>
+          {trigger && (
+            <button
+              type="button"
+              onClick={trigger.onConnect}
+              title={
+                trigger.connected
+                  ? "Refresh starts a data run from this browser. Click to remove the saved token."
+                  : "Save a GitHub token so Refresh fetches fresh data instead of reloading"
+              }
+              className="text-2xs text-ink-3 underline-offset-2 hover:text-ink-2 hover:underline"
+            >
+              {trigger.connected ? "Live refresh on" : "Enable live refresh"}
+            </button>
+          )}
         </div>
       </div>
 

@@ -293,7 +293,8 @@ export const REFRESH = {
 
 /**
  * Pipeline age (ms) past which a block is downgraded LIVE -> DELAYED -> STALE.
- * Calibrated for the ~5 minute published-snapshot cadence. This is about the
+ * Calibrated for the ~2 minute published-snapshot cadence, with room for runs
+ * GitHub queues or drops. This is about the
  * refresh pipeline, not market hours — a daily series is labelled with its
  * own observation date separately.
  */
