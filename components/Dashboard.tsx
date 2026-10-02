@@ -29,11 +29,15 @@ const PENDING_TIMEOUT_MS = 8 * 60_000;
 class NewerVersionError extends Error {}
 
 /**
- * Cache-busted: GitHub Pages serves files with max-age=600, which would
- * otherwise pin a ten-minute-old snapshot in the browser.
+ * Published snapshots live on the repo's `data` branch, not in the Pages site:
+ * Pages silently stops publishing a site redeployed every few minutes. Locally
+ * (no repo) they are the files `npm run data` writes.
  */
+const SNAPSHOT_BASE = REPO ? `https://raw.githubusercontent.com/${REPO}/data` : `${BASE_PATH}/data`;
+
+/** Cache-busted: both hosts send max-age (300-600s) that would pin an old snapshot. */
 async function fetchSnapshot<T>(file: string): Promise<T> {
-  const res = await fetch(`${BASE_PATH}/data/${file}?t=${Date.now()}`, { cache: "no-store" });
+  const res = await fetch(`${SNAPSHOT_BASE}/${file}?t=${Date.now()}`, { cache: "no-store" });
   if (!res.ok) throw new Error(`${file}: HTTP ${res.status}`);
   return (await res.json()) as T;
 }
@@ -104,12 +108,14 @@ export function Dashboard({
     setNow(Date.now());
     const clock = setInterval(() => setNow(Date.now()), CLOCK_TICK_MS);
     const poll = setInterval(() => void load(), REFRESH.dashboard);
-    if (!initialData) void load();
+    // The embedded snapshot is from the last site deploy, which can be hours
+    // older than the data branch, so fetch straight away.
+    void load();
     return () => {
       clearInterval(clock);
       clearInterval(poll);
     };
-  }, [initialData, load]);
+  }, [load]);
 
   // Whether Refresh can start a run, rather than only reload the snapshot.
   // Read after mount: the prerendered HTML has no localStorage.

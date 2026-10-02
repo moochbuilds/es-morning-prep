@@ -267,15 +267,20 @@ call. Without a key, the deterministic writer runs and no request is made.
 ## Hosting: GitHub Pages, free with no metering
 
 The site is a static export. A GitHub Action runs the tests, fetches every
-source once, writes `public/data/*.json`, builds the site and publishes it to
-Pages. Visitors download static files and never trigger a fetch.
+source once, writes `public/data/*.json` and force-pushes those files as the
+single commit on the `data` branch. The page reads them from
+raw.githubusercontent.com. The site itself is rebuilt and deployed to Pages only
+on a push to `main` (or a manual run with **deploy** ticked): Pages throttles a
+site redeployed every couple of minutes, still reporting each deploy as a
+success while serving an hours-old build. Visitors download static files and
+never trigger a fetch.
 
 | | |
 |---|---|
 | Refresh cadence | ~2 min weekdays 7am–5pm ET; ~10 min overnight while futures trade; hourly while they're closed (Fri 5pm – Sun 6pm ET) |
 | On demand | **Refresh** in the header starts a run, once live refresh is enabled (below) |
 | Cost | Free: Actions minutes are free for public repos, and Pages is free static hosting |
-| Page load | Served from GitHub's CDN, with the latest snapshot embedded in the HTML |
+| Page load | Served from GitHub's CDN, then fetches the current snapshot from the `data` branch |
 | Polling | The page checks for a newer snapshot every 60s (static file, no cost) |
 
 Resilience:

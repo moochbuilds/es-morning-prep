@@ -6,6 +6,11 @@ on:
   # Started by the previous run (the `next` job below) and by the page's
   # Refresh button.
   workflow_dispatch:
+    inputs:
+      deploy:
+        description: Also redeploy the Pages site (pushes to main always do)
+        type: boolean
+        default: false
   # Only a restart for the chain. GitHub's scheduler is best effort and drops
   # most of these under load (down to ~6 runs a day in Sep 2026).
   schedule:
@@ -25,7 +30,7 @@ on:
 
 permissions:
   actions: write # the next run in the chain
-  contents: write # keepalive heartbeat commit
+  contents: write # data branch, keepalive heartbeat commit
   pages: write
   id-token: write
 
@@ -60,18 +65,34 @@ jobs:
       - name: Test engine
         run: npm test
 
-      - id: pages
-        uses: actions/configure-pages@v5
-
       - name: Fetch market data
         run: npm run data
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           # Last known good values for any provider that fails this run.
-          PREVIOUS_SNAPSHOT_URL: ${{ steps.pages.outputs.base_url }}/data/dashboard.json
+          PREVIOUS_SNAPSHOT_URL: https://raw.githubusercontent.com/${{ github.repository }}/data/dashboard.json
+
+      # The page reads snapshots from the `data` branch rather than the Pages
+      # site: Pages throttles a site redeployed every couple of minutes, still
+      # reporting each deploy as a success but serving an hours-old build. The
+      # branch is one force-pushed commit, so it never accumulates history.
+      - name: Publish data snapshot
+        working-directory: public/data
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git init -q -b data
+          git add -A
+          git -c user.name="github-actions[bot]"               -c user.email="41898282+github-actions[bot]@users.noreply.github.com"               commit -q -m "Data snapshot $(date -u +%FT%TZ)"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" data
+
+      - id: pages
+        if: github.event_name == 'push' || inputs.deploy
+        uses: actions/configure-pages@v5
 
       - name: Build static site
+        if: steps.pages.outcome == 'success'
         run: npm run build
         env:
           NEXT_PUBLIC_BASE_PATH: ${{ steps.pages.outputs.base_path }}
@@ -79,11 +100,13 @@ jobs:
           NEXT_PUBLIC_GITHUB_REPOSITORY: ${{ github.repository }}
 
       - uses: actions/upload-pages-artifact@v3
+        if: steps.pages.outcome == 'success'
         with:
           path: out
 
   deploy:
     needs: build
+    if: github.event_name == 'push' || inputs.deploy
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -107,7 +130,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           STARTED: ${{ needs.build.outputs.started }}
-          FAILED: ${{ needs.build.result != 'success' || needs.deploy.result != 'success' }}
+          FAILED: ${{ needs.build.result != 'success' || needs.deploy.result == 'failure' }}
           TZ: America/New_York
         run: |
           # Futures trade Sun 6pm to Fri 5pm ET. While they're closed the
